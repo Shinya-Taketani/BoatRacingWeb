@@ -91,6 +91,25 @@ def test_absence_has_no_start_data(parsed):
         assert r.race_time is None
 
 
+L_SAMPLE_PATH = DATA_DIR / "K231007.TXT"
+
+
+@pytest.mark.skipif(
+    not L_SAMPLE_PATH.exists(),
+    reason=f"real fixture not found: {L_SAMPLE_PATH} (出遅れ(L)実例のバックフィル取得時に確認したファイル)",
+)
+def test_delayed_start_has_no_st_like_absence():
+    # 実データで確認: L(出遅れ)は "L ." というK(欠場)と同じ「値なし」表記であり、
+    # Fのような数値+符号反転(-0.01等)ではない。当初はFと同様に数値として
+    # パースしようとして ResultParseError になっていた不具合の再発防止。
+    result = parse_result_path(L_SAMPLE_PATH)
+    rows = [r for r in result.results if r.status in {"L0", "L1"}]
+    assert rows
+    for r in rows:
+        assert r.finish_pos is None
+        assert r.st is None
+
+
 def test_finish_pos_and_status_are_mutually_exclusive(parsed):
     # finish_pos と status はどちらか一方のみが埋まり、両方None/両方値ありにはならない
     for r in parsed.results:

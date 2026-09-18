@@ -55,6 +55,7 @@ class _ExistingPeriod:
 class RacerCompactionResult:
     inserted: int = 0
     updated: int = 0
+    deleted: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -63,6 +64,7 @@ class CompactionSummary:
     racers_processed: int
     inserted: int
     updated: int
+    deleted: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -106,12 +108,18 @@ def _compute_periods(rows: list[tuple]) -> tuple[list[_ComputedPeriod], list[str
         values = tuple(values)
         if values != current_values:
             new_period_key = period_key_for(observed_date)
-            stable_changed = any(
-                current_values[i] != values[i] for i in _PERIOD_KEY_STABLE_INDICES
-            )
-            if new_period_key == current_period_key and stable_changed:
+            changed_stable_columns = [
+                (col, current_values[i], values[i])
+                for col, i in zip(_PERIOD_KEY_STABLE_COLUMNS, _PERIOD_KEY_STABLE_INDICES)
+                if current_values[i] != values[i]
+            ]
+            if new_period_key == current_period_key and changed_stable_columns:
+                changes_desc = ", ".join(
+                    f"{col} {before!r} -> {after!r}"
+                    for col, before, after in changed_stable_columns
+                )
                 warnings.append(
-                    f"racer_class/branch changed within the same period ({new_period_key}) "
+                    f"{changes_desc} changed within the same period ({new_period_key}) "
                     f"on {observed_date} (expected only at period boundaries)"
                 )
             periods.append(_ComputedPeriod(current_start, observed_date, current_values))
@@ -159,6 +167,35 @@ def _fetch_existing_periods(cur: psycopg.Cursor, racer_id: int) -> list[_Existin
     ]
 
 
+def _ranges_overlap(
+    a_from: date, a_to: date | None, b_from: date, b_to: date | None
+) -> bool:
+    starts_before_b_ends = b_to is None or a_from < b_to
+    ends_after_b_starts = a_to is None or a_to > b_from
+    return starts_before_b_ends and ends_after_b_starts
+
+
+def _fully_absorbed(
+    existing_from: date, existing_to: date | None, container_from: date, container_to: date | None
+) -> bool:
+    """existing期間が container期間(computed) に完全に含まれるか。部分重複はFalse。"""
+    if existing_from < container_from:
+        return False
+    if container_to is None:
+        return True
+    if existing_to is None:
+        return False
+    return existing_to <= container_to
+
+
+def _count_referencing_race_entries(cur: psycopg.Cursor, racer_period_id: int) -> int:
+    cur.execute(
+        "SELECT count(*) FROM race_entries WHERE racer_period_id = %s",
+        (racer_period_id,),
+    )
+    return cur.fetchone()[0]
+
+
 def _compact_one_racer(conn: psycopg.Connection, racer_id: int) -> RacerCompactionResult:
     with conn.cursor() as cur:
         rows = _fetch_daily_snapshot_rows(cur, racer_id)
@@ -170,21 +207,58 @@ def _compact_one_racer(conn: psycopg.Connection, racer_id: int) -> RacerCompacti
         existing_by_start = {p.valid_from: p for p in existing_periods}
         computed_starts = {p.valid_from for p in computed_periods}
 
-        for existing in existing_periods:
-            if existing.valid_from not in computed_starts:
-                warnings.append(
-                    f"racer_id={racer_id}: existing racer_periods row "
-                    f"valid_from={existing.valid_from} has no matching computed period; "
-                    "leaving it untouched"
-                )
+        # computedのどの期間のvalid_startにも一致しない既存行。backfillで過去日付が
+        # 後から追加され、期間の境界がより早い日付にずれた場合にここに入る。
+        orphaned = {p.valid_from: p for p in existing_periods if p.valid_from not in computed_starts}
 
         inserted = 0
         updated = 0
+        deleted = 0
 
         for cp in computed_periods:
             existing = existing_by_start.get(cp.valid_from)
 
             if existing is None:
+                # このcomputed期間と重なる孤立した既存行を先に解消する。
+                overlapping = [
+                    p
+                    for p in list(orphaned.values())
+                    if _ranges_overlap(cp.valid_from, cp.valid_to, p.valid_from, p.valid_to)
+                ]
+                for stale in overlapping:
+                    if not _fully_absorbed(
+                        stale.valid_from, stale.valid_to, cp.valid_from, cp.valid_to
+                    ):
+                        raise CompactionError(
+                            f"racer_id={racer_id}: computed period "
+                            f"[{cp.valid_from}, {cp.valid_to}) partially overlaps existing "
+                            f"racer_periods row (id={stale.id}, valid_from={stale.valid_from}, "
+                            f"valid_to={stale.valid_to}) without fully containing it. "
+                            "Refusing to auto-resolve a partial overlap; review manually."
+                        )
+
+                    ref_count = _count_referencing_race_entries(cur, stale.id)
+                    if ref_count > 0:
+                        raise CompactionError(
+                            f"racer_id={racer_id}: existing racer_periods row "
+                            f"(id={stale.id}, valid_from={stale.valid_from}, "
+                            f"valid_to={stale.valid_to}) is fully absorbed by computed period "
+                            f"[{cp.valid_from}, {cp.valid_to}) but is still referenced by "
+                            f"{ref_count} race_entries row(s); refusing to delete an "
+                            "already-published period. Resolve manually."
+                        )
+
+                    cur.execute("DELETE FROM racer_periods WHERE id = %s", (stale.id,))
+                    deleted += 1
+                    del orphaned[stale.valid_from]
+                    logger.warning(
+                        "racer_id=%s: deleted stale racer_periods row id=%s "
+                        "(valid_from=%s, valid_to=%s), fully absorbed by newly computed "
+                        "period [%s, %s) and unreferenced by race_entries",
+                        racer_id, stale.id, stale.valid_from, stale.valid_to,
+                        cp.valid_from, cp.valid_to,
+                    )
+
                 cur.execute(
                     f"""
                     INSERT INTO racer_periods (
@@ -214,10 +288,20 @@ def _compact_one_racer(conn: psycopg.Connection, racer_id: int) -> RacerCompacti
                 )
                 updated += 1
 
+        for stale in orphaned.values():
+            warnings.append(
+                f"racer_id={racer_id}: existing racer_periods row "
+                f"valid_from={stale.valid_from} has no matching or overlapping computed "
+                "period; leaving it untouched"
+            )
+
+    if deleted:
+        logger.warning("racer_id=%s: deleted %d stale racer_periods row(s)", racer_id, deleted)
+
     for w in warnings:
         logger.warning("racer_id=%s: %s", racer_id, w)
 
-    return RacerCompactionResult(inserted=inserted, updated=updated, warnings=warnings)
+    return RacerCompactionResult(inserted=inserted, updated=updated, deleted=deleted, warnings=warnings)
 
 
 def compact_racer_periods(
@@ -241,12 +325,13 @@ def compact_racer_periods(
                 )
 
     try:
-        inserted = updated = 0
+        inserted = updated = deleted = 0
         warnings: list[str] = []
         for racer_id in target_ids:
             result = _compact_one_racer(conn, racer_id)
             inserted += result.inserted
             updated += result.updated
+            deleted += result.deleted
             warnings.extend(result.warnings)
     except Exception:
         conn.rollback()
@@ -257,5 +342,6 @@ def compact_racer_periods(
         racers_processed=len(target_ids),
         inserted=inserted,
         updated=updated,
+        deleted=deleted,
         warnings=warnings,
     )

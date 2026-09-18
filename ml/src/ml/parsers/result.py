@@ -25,18 +25,22 @@ CRLF区切り）。program.py（番組表(B)）と対になるファイルで、
 着順が数値でない行（フライング・出遅れ・欠場・失格等）は finish_pos=None
 とし、記号は status に格納する。想定していない記号は ResultParseError を
 送出する（黙ってスキップしない）。ST(スタートタイミング)は F 表記
-（フライング、例: F0.01）を負値に変換する。L 表記（出遅れ）はフライングと
-符号の意味が逆（信号後の遅れ）なので負値化せず、そのままの値として扱う
-（別扱い）。
+（フライング、例: F0.01）を負値に変換する。L 表記（出遅れ）は実データで
+"L ."（K の "K ." と同じ「値なし」表記）であることを確認しており、
+出遅れは信号後に有効なSTが計測されないため欠損(None)として扱う
+（Fのような数値+符号反転ではない）。
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+
+logger = logging.getLogger(__name__)
 
 _VALID_STATUSES = {
     "F",   # フライング
@@ -48,6 +52,7 @@ _VALID_STATUSES = {
     "S1",  # 失格（進入後）
     "S2",  # 失格（妨害）
     "S3",  # 失格（その他）
+    "00",  # レース不成立（他艇の複数フライング等で成立しなかったレース）
 }
 
 _SEPARATOR = "-" * 79
@@ -142,7 +147,18 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
         i += 1
 
         race_date: date | None = None
+        placeholder_no_data = False
         while race_date is None:
+            # 開催日が一度も見つからないまま自場の{code}KENDに到達した場合、
+            # その場のデータがファイル生成時点でまだ確定していなかった
+            # プレースホルダーブロックとみなす（program.pyと同一の不具合・
+            # 同一の修正方針。文言には依存せずKEND到達のみで判定する）。
+            end_m = _STADIUM_MARK_RE.match(text_at(i))
+            if end_m and end_m.group(1) == f"{stadium_code:02d}" and end_m.group(2) == "END":
+                i += 1
+                placeholder_no_data = True
+                break
+
             dm = _DATE_RE.search(text_at(i))
             if dm:
                 race_date = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
@@ -152,14 +168,36 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
                     f"race date not found in stadium header (code={stadium_code:02d})"
                 )
 
+        if placeholder_no_data:
+            logger.warning(
+                "stadium_code=%02d: reached %02dKEND before any race date was found; "
+                "treating as an unconfirmed/placeholder block with 0 races",
+                stadium_code, stadium_code,
+            )
+            continue
+
+        # 全レース中止（台風等の全面中止）の場合、場ブロックに開催日はあっても
+        # レースは1つも無く、次の {code}KEND に直接到達する。この場合はこの場を
+        # 0件として次の場ブロックへ進む（黙ってスキップするのではなく、
+        # 対応する終了マーカーであることは確認した上で許容する）。
+        no_races_this_stadium = False
         while not _RACE_HEADER_RE.match(normalized_at(i)):
-            if _STADIUM_MARK_RE.match(text_at(i)):
-                raise ResultParseError(
-                    f"stadium {stadium_code:02d} block has no races (line {i})"
-                )
+            end_m = _STADIUM_MARK_RE.match(text_at(i))
+            if end_m:
+                if end_m.group(1) != f"{stadium_code:02d}" or end_m.group(2) != "END":
+                    raise ResultParseError(
+                        f"line {i}: expected '{stadium_code:02d}KEND' or a race header, "
+                        f"got {text_at(i)!r}"
+                    )
+                i += 1
+                no_races_this_stadium = True
+                break
             i += 1
             if i >= n:
                 raise ResultParseError("race header not found before end of file")
+
+        if no_races_this_stadium:
+            continue
 
         while True:
             rm = _RACE_HEADER_RE.match(normalized_at(i))
@@ -283,13 +321,17 @@ def _parse_result_line(
 
 def _parse_finish(raw: str, line_no: int) -> tuple[int | None, str | None]:
     s = raw.strip()
-    if s.isdigit():
-        return int(s), None
+    # "00"（レース不成立）等、数字だけで構成されるがfinish_posではない記号が
+    # あるため、isdigit判定より先にホワイトリストを見る。
     if s in _VALID_STATUSES:
         return None, s
+    if s.isdigit():
+        value = int(s)
+        if 1 <= value <= 6:
+            return value, None
     raise ResultParseError(
         f"line {line_no}: unknown finish_pos/status symbol {s!r} "
-        f"(expected a digit or one of {sorted(_VALID_STATUSES)})"
+        f"(expected 1-6 or one of {sorted(_VALID_STATUSES)})"
     )
 
 
@@ -308,7 +350,10 @@ def _parse_start_course(raw: str, line_no: int) -> int | None:
 
 def _parse_st(raw: str, line_no: int) -> Decimal | None:
     s = raw.strip()
-    if not s or s.startswith("K"):
+    # K(欠場)・L(出遅れ)はいずれも実データで "K ." "L ." という
+    # 「値なし」表記であることを確認済み（出遅れは有効な信号後のSTが
+    # 計測されないため、Fのような数値+符号反転ではなく欠損として扱う）。
+    if not s or s.startswith("K") or s.startswith("L"):
         return None
     if s.startswith("F"):
         digits = s[1:].strip()
@@ -316,13 +361,6 @@ def _parse_st(raw: str, line_no: int) -> Decimal | None:
             return -Decimal(digits)
         except InvalidOperation as exc:
             raise ResultParseError(f"line {line_no}: invalid F-prefixed ST: {s!r}") from exc
-    if s.startswith("L"):
-        # 出遅れ: フライングとは符号の意味が逆（信号後の遅れ）のため負値化しない
-        digits = s[1:].strip()
-        try:
-            return Decimal(digits)
-        except InvalidOperation as exc:
-            raise ResultParseError(f"line {line_no}: invalid L-prefixed ST: {s!r}") from exc
     try:
         return Decimal(s)
     except InvalidOperation as exc:

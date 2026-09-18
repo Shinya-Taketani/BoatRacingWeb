@@ -97,6 +97,17 @@ return [
             'prefix_indexes' => true,
             'search_path' => 'public',
             'sslmode' => env('DB_SSLMODE', 'prefer'),
+            // config/app.php の timezone(UTC)とDBセッションのTimeZoneを一致させる。
+            // Laravel は DateTimeInterface のバインド値を
+            // Grammar::getDateFormat()="Y-m-d H:i:s"（オフセットなしのnaive文字列）
+            // で埋め込むため、PostgreSQLはこの文字列をセッションのTimeZoneで解釈する。
+            // ここを未設定のままにすると PostgresConnector::configureTimezone() が
+            // 何も実行せず、セッションはサーバ/ロール側のデフォルト（このDBでは
+            // Asia/Tokyo）のままになり、UTCで書式化された値がJSTとして誤解釈され
+            // timestamptz カラムの値が9時間ズレて保存される
+            // （2026-09-17の調査でrace_id=1420のcaptured_atが実測: diff=-32400秒
+            // で再現・本設定追加で診断・修正済み）。
+            'timezone' => 'UTC',
         ],
 
         'sqlsrv' => [

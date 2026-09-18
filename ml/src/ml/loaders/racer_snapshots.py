@@ -14,23 +14,26 @@ from datetime import date
 
 import psycopg
 
+from ml.loaders.racers import get_or_create_racer
 from ml.parsers.program import RaceEntryRecord, RacerSnapshot
 
 logger = logging.getLogger(__name__)
 
 
 def period_key_for(d: date) -> str:
-    """公式レーサーランク改定期（前期5-10月/後期11-4月）のキーを返す。
+    """公式レーサーランク改定期（前期1-6月/後期7-12月）のキーを返す。
 
-    例: 2026-06-01 -> "2026H1"（2026年前期）
-        2026-12-01 -> "2026H2"（2026年後期）
-        2027-02-01 -> "2026H2"（2026年11月に始まった後期の継続）
+    当初は前期5-10月/後期11-4月と仮定していたが、racer_daily_snapshots の
+    実データで racer_class の変化日を集計したところ1月・7月に9割以上が
+    集中しており（5月・11月付近はほぼ0件）、この仮定が誤りだったと判明した
+    ため1月/7月境界に修正した（2026-09-18の調査）。
+
+    例: 2026-03-01 -> "2026H1"（2026年前期）
+        2026-09-01 -> "2026H2"（2026年後期）
     """
-    if 5 <= d.month <= 10:
+    if 1 <= d.month <= 6:
         return f"{d.year}H1"
-    if d.month in (11, 12):
-        return f"{d.year}H2"
-    return f"{d.year - 1}H2"
+    return f"{d.year}H2"
 
 
 def _value_tuple(racer: RacerSnapshot) -> tuple:
@@ -51,6 +54,7 @@ def _value_tuple(racer: RacerSnapshot) -> tuple:
 @dataclass(frozen=True)
 class UpsertResult:
     upserted: int
+    racer_ids: set[int] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -75,21 +79,6 @@ _UPSERT_SQL = """
 """
 
 
-def _get_or_create_racer(cur: psycopg.Cursor, registration_number: int, name: str) -> int:
-    cur.execute(
-        """
-        INSERT INTO racers (registration_number, name, created_at, updated_at)
-        VALUES (%s, %s, now(), now())
-        ON CONFLICT (registration_number) DO UPDATE SET
-            name = EXCLUDED.name,
-            updated_at = now()
-        RETURNING id
-        """,
-        (registration_number, name),
-    )
-    return cur.fetchone()[0]
-
-
 def upsert_daily_snapshots(
     conn: psycopg.Connection,
     entries: list[RaceEntryRecord],
@@ -108,6 +97,7 @@ def upsert_daily_snapshots(
 
     warnings: list[str] = []
     upserted = 0
+    racer_ids: set[int] = set()
 
     with conn.cursor() as cur:
         for (registration_number, observed_date), racers in groups.items():
@@ -122,7 +112,8 @@ def upsert_daily_snapshots(
                 warnings.append(msg)
                 logger.warning(msg)
 
-            racer_id = _get_or_create_racer(cur, registration_number, chosen.name)
+            racer_id = get_or_create_racer(cur, registration_number, chosen.name)
+            racer_ids.add(racer_id)
             period_key = period_key_for(observed_date)
 
             cur.execute(
@@ -144,4 +135,4 @@ def upsert_daily_snapshots(
             upserted += 1
 
     conn.commit()
-    return UpsertResult(upserted=upserted, warnings=warnings)
+    return UpsertResult(upserted=upserted, racer_ids=racer_ids, warnings=warnings)

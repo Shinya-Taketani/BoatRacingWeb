@@ -29,12 +29,15 @@ JST の aware datetime にする。想定外の行・桁位置の不整合・値
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 
@@ -65,7 +68,7 @@ _OFF_BOAT_WIN_RATE_2 = slice(59, 64)
 _STADIUM_MARK_RE = re.compile(r"^(\d{2})B(BGN|END)$")
 _DATE_RE = re.compile(r"第\s*\d+日\s+(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
 _RACE_HEADER_RE = re.compile(
-    r"^\s*(\d{1,2})R\s+(.*?)\s*H\d+m.*?締切予定(\d{1,2}):(\d{2})\s*$"
+    r"^\s*(\d{1,2})R\s+(.*?)\s*H(\d+)m.*?締切予定(\d{1,2}):(\d{2})\s*$"
 )
 
 
@@ -117,6 +120,7 @@ class RaceRecord:
     race_date: date
     race_no: int
     title: str
+    distance_m: int
     deadline_at: datetime  # JST aware
 
 
@@ -169,7 +173,21 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
         i += 1
 
         race_date: date | None = None
+        placeholder_no_data = False
         while race_date is None:
+            # 開催日が一度も見つからないまま自場の{code}BENDに到達した場合、
+            # その場のデータがファイル生成時点でまだ確定していなかった
+            # プレースホルダーブロックとみなす。判定はBEND到達のみで行い、
+            # 中の文言（"この場のデータ更新は..."等、将来変わりうる）には
+            # 依存しない。これを見逃すと、日付探索が場の境界を越えて次の
+            # 場の見出し行から誤った日付を拾い、以降のレースを全て隣の場の
+            # ものとして誤登録してしまう。
+            end_m = _STADIUM_MARK_RE.match(text_at(i))
+            if end_m and end_m.group(1) == f"{stadium_code:02d}" and end_m.group(2) == "END":
+                i += 1
+                placeholder_no_data = True
+                break
+
             dm = _DATE_RE.search(normalized_at(i))
             if dm:
                 race_date = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
@@ -179,14 +197,36 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
                     f"race date not found in stadium header (code={stadium_code:02d})"
                 )
 
+        if placeholder_no_data:
+            logger.warning(
+                "stadium_code=%02d: reached %02dBEND before any race date was found; "
+                "treating as an unconfirmed/placeholder block with 0 races",
+                stadium_code, stadium_code,
+            )
+            continue
+
+        # 全レース中止（台風等）の場合、場ブロックに開催日はあってもレースが
+        # 1つも無く、次の {code}BEND に直接到達することがある。この場合は
+        # この場を0件として次の場ブロックへ進む（対応する終了マーカーで
+        # あることを確認した上で許容する。黙ってスキップするのではない）。
+        no_races_this_stadium = False
         while not _RACE_HEADER_RE.match(normalized_at(i)):
-            if _STADIUM_MARK_RE.match(text_at(i)):
-                raise ProgramParseError(
-                    f"stadium {stadium_code:02d} block has no races (line {i})"
-                )
+            end_m = _STADIUM_MARK_RE.match(text_at(i))
+            if end_m:
+                if end_m.group(1) != f"{stadium_code:02d}" or end_m.group(2) != "END":
+                    raise ProgramParseError(
+                        f"line {i}: expected '{stadium_code:02d}BEND' or a race header, "
+                        f"got {text_at(i)!r}"
+                    )
+                i += 1
+                no_races_this_stadium = True
+                break
             i += 1
             if i >= n:
                 raise ProgramParseError("race header not found before end of file")
+
+        if no_races_this_stadium:
+            continue
 
         while True:
             rm = _RACE_HEADER_RE.match(normalized_at(i))
@@ -194,7 +234,8 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
                 raise ProgramParseError(f"line {i}: expected race header, got {text_at(i)!r}")
             race_no = int(rm.group(1))
             title = rm.group(2).strip()
-            hour, minute = int(rm.group(3)), int(rm.group(4))
+            distance_m = int(rm.group(3))
+            hour, minute = int(rm.group(4)), int(rm.group(5))
             deadline_at = datetime(
                 race_date.year, race_date.month, race_date.day, hour, minute, tzinfo=JST
             )
@@ -204,6 +245,7 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
                     race_date=race_date,
                     race_no=race_no,
                     title=title,
+                    distance_m=distance_m,
                     deadline_at=deadline_at,
                 )
             )

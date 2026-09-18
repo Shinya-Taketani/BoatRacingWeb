@@ -15,7 +15,7 @@ return new class extends Migration
         Schema::create('racer_daily_snapshots', function (Blueprint $table) {
             $table->foreignId('racer_id')->constrained('racers')->restrictOnDelete();
             $table->date('observed_date');
-            $table->string('period_key', 6); // 例: "2026H1" = 2026年前期(5-10月)
+            $table->string('period_key', 6); // 例: "2026H1" = 2026年前期(1-6月)
             $table->string('racer_class'); // A1 / A2 / B1 / B2
             $table->string('branch')->nullable();
             $table->decimal('weight', 5, 2)->nullable();
