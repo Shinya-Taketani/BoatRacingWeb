@@ -30,3 +30,4 @@ Thumbs.db
 /ml/data
 __pycache__/
 *.pyc
+/ml/models/*.pkl
