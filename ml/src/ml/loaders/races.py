@@ -54,16 +54,20 @@ def _upsert_race(cur: psycopg.Cursor, race: RaceRecord, stadium_id: int) -> int:
     cur.execute(
         """
         INSERT INTO races (race_date, stadium_id, race_no, deadline_at, distance_m, title,
-                            created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                            event_name, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now())
         ON CONFLICT (race_date, stadium_id, race_no) DO UPDATE SET
             deadline_at = EXCLUDED.deadline_at,
             distance_m = EXCLUDED.distance_m,
             title = EXCLUDED.title,
+            event_name = EXCLUDED.event_name,
             updated_at = now()
         RETURNING id
         """,
-        (race.race_date, stadium_id, race.race_no, race.deadline_at, race.distance_m, race.title),
+        (
+            race.race_date, stadium_id, race.race_no, race.deadline_at, race.distance_m,
+            race.title, race.event_name,
+        ),
     )
     return cur.fetchone()[0]
 
@@ -102,14 +106,15 @@ def _upsert_race_entry(
     cur.execute(
         """
         INSERT INTO race_entries (
-            race_id, racer_id, racer_period_id, lane,
+            race_id, racer_id, racer_period_id, age, lane,
             motor_no, motor_win_rate_2, boat_no, boat_win_rate_2, weight,
             created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
         ON CONFLICT (race_id, lane) DO UPDATE SET
             racer_id = EXCLUDED.racer_id,
             racer_period_id = EXCLUDED.racer_period_id,
+            age = EXCLUDED.age,
             motor_no = EXCLUDED.motor_no,
             motor_win_rate_2 = EXCLUDED.motor_win_rate_2,
             boat_no = EXCLUDED.boat_no,
@@ -121,6 +126,7 @@ def _upsert_race_entry(
             race_id,
             racer_id,
             racer_period_id,
+            entry.racer.age,
             entry.lane,
             entry.motor_no,
             entry.motor_win_rate_2,

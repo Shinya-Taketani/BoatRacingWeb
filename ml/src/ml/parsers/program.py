@@ -67,6 +67,8 @@ _OFF_BOAT_WIN_RATE_2 = slice(59, 64)
 
 _STADIUM_MARK_RE = re.compile(r"^(\d{2})B(BGN|END)$")
 _DATE_RE = re.compile(r"第\s*\d+日\s+(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
+# 「＊＊＊　番組表　＊＊＊」の直後（空行を挟む）の非空行が大会名。
+_PROGRAM_MARKER_RE = re.compile(r"\*+\s*番組表\s*\*+")
 _RACE_HEADER_RE = re.compile(
     r"^\s*(\d{1,2})R\s+(.*?)\s*H(\d+)m.*?締切予定(\d{1,2}):(\d{2})\s*$"
 )
@@ -122,6 +124,7 @@ class RaceRecord:
     title: str
     distance_m: int
     deadline_at: datetime  # JST aware
+    event_name: str | None  # 大会名（例: "第71回ボートレースダービー"）。グレード推定の元データ
 
 
 @dataclass(frozen=True)
@@ -173,6 +176,7 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
         i += 1
 
         race_date: date | None = None
+        event_name: str | None = None
         placeholder_no_data = False
         while race_date is None:
             # 開催日が一度も見つからないまま自場の{code}BENDに到達した場合、
@@ -188,7 +192,19 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
                 placeholder_no_data = True
                 break
 
-            dm = _DATE_RE.search(normalized_at(i))
+            normalized = normalized_at(i)
+
+            # 「＊＊＊　番組表　＊＊＊」の直後の最初の非空行が大会名
+            # （例: "第71回ボートレースダービー"）。前後を消費しないよう
+            # 先読みのみ行い、メインの日付探索のステップ(i)は動かさない。
+            if event_name is None and _PROGRAM_MARKER_RE.search(normalized):
+                j = i + 1
+                while j < n and text_at(j).strip() == "":
+                    j += 1
+                if j < n:
+                    event_name = text_at(j).strip()
+
+            dm = _DATE_RE.search(normalized)
             if dm:
                 race_date = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
             i += 1
@@ -247,6 +263,7 @@ def parse_program_bytes(raw: bytes) -> ParsedProgram:
                     title=title,
                     distance_m=distance_m,
                     deadline_at=deadline_at,
+                    event_name=event_name,
                 )
             )
             i += 1
