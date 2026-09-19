@@ -21,3 +21,14 @@ Schedule::command('races:fetch-today')
 Schedule::command('odds:schedule-today')
     ->dailyAt('06:05')
     ->timezone(config('app.race_timezone'));
+
+// レース一覧の取り込み(06:00)の後、当日分の特徴量生成→推論を行い、
+// predictions/prediction_entries に書き込む。
+Schedule::command('predictions:generate-today')
+    ->dailyAt('06:10')
+    ->timezone(config('app.race_timezone'));
+
+// その日の全レース終了後、結果が確定した予測をまとめて判定する。
+Schedule::command('predictions:judge')
+    ->dailyAt('23:30')
+    ->timezone(config('app.race_timezone'));

@@ -199,6 +199,77 @@ def predict_race_normalized(
     )
 
 
+LAMBDARANK_PARAMS = {
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "ndcg_eval_at": [1],
+    "verbosity": -1,
+    "seed": 0,
+}
+
+
+def _race_group_sizes(df: pl.DataFrame) -> list[int]:
+    """dfがrace_id昇順に整列済みである前提で、連続するrace_idごとの行数を返す
+    （lgb.Datasetのgroupパラメータはこの並び順を前提にする）。
+    """
+    return (
+        df.select("race_id")
+        .group_by("race_id", maintain_order=True)
+        .agg(pl.len())["len"]
+        .to_list()
+    )
+
+
+def train_lambdarank_model(
+    train_df: pl.DataFrame,
+    feature_columns: list[str],
+    *,
+    params: dict | None = None,
+    num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
+) -> lgb.Booster:
+    """objective='lambdarank'で、race_idをグループとした順位学習を行う。
+
+    is_winner(0/1)をそのままrelevanceラベルとして使う（1着=relevance 1）。
+    """
+    X_train, y_train = _to_xy(train_df, feature_columns)
+    group = _race_group_sizes(train_df)
+    train_set = lgb.Dataset(
+        X_train,
+        label=y_train,
+        group=group,
+        feature_name=feature_columns,
+        categorical_feature=[
+            feature_columns.index(c) for c in CATEGORICAL_FEATURES if c in feature_columns
+        ],
+        free_raw_data=False,
+    )
+    return lgb.train(
+        {**LAMBDARANK_PARAMS, **(params or {})}, train_set, num_boost_round=num_boost_round
+    )
+
+
+def predict_race_softmax(
+    booster: lgb.Booster, df: pl.DataFrame, feature_columns: list[str]
+) -> pl.DataFrame:
+    """LambdaRankの生スコア(符号・範囲不定)を、レース内softmaxで確率分布に変換する。
+
+    binaryモデルの「合計1になるよう正規化」と役割は同じだが、lambdarankの
+    スコアは負値も取りうり単純な合計での正規化ができないためsoftmaxを使う。
+    """
+    X, _ = _to_xy(df, feature_columns)
+    raw_pred = booster.predict(X)
+
+    result = df.select(["race_id", "lane", "is_winner"]).with_columns(
+        pl.Series("raw_pred", raw_pred)
+    )
+    result = result.with_columns(
+        (pl.col("raw_pred") - pl.col("raw_pred").max().over("race_id")).alias("shifted")
+    ).with_columns(pl.col("shifted").exp().alias("exp_score"))
+    return result.with_columns(
+        (pl.col("exp_score") / pl.col("exp_score").sum().over("race_id")).alias("pred_prob")
+    ).select(["race_id", "lane", "is_winner", "pred_prob"])
+
+
 def evaluate(result: pl.DataFrame) -> dict:
     """result: race_id, lane, is_winner, pred_prob を持つDataFrame。"""
     total_races = result.select(pl.col("race_id").n_unique()).item()
@@ -330,6 +401,19 @@ def _run(
     return RunResult(label=label, metrics=metrics, result=result, booster=booster)
 
 
+def _run_lambdarank(
+    label: str,
+    train_df: pl.DataFrame,
+    val_df: pl.DataFrame,
+    feature_columns: list[str],
+    num_boost_round: int,
+) -> RunResult:
+    booster = train_lambdarank_model(train_df, feature_columns, num_boost_round=num_boost_round)
+    result = predict_race_softmax(booster, val_df, feature_columns)
+    metrics = evaluate(result)
+    return RunResult(label=label, metrics=metrics, result=result, booster=booster)
+
+
 def _print_metrics(run: RunResult) -> None:
     m = run.metrics
     print(f"\n--- {run.label} ---")
@@ -388,7 +472,14 @@ def main(argv: list[str] | None = None) -> int:
         args.num_boost_round,
     )
     run_all = _run(
-        "v1_basic + v2_recent + v3_relative",
+        "v1_basic + v2_recent + v3_relative (binary)",
+        all_train_df,
+        all_val_df,
+        ALL_FEATURE_COLUMNS,
+        args.num_boost_round,
+    )
+    run_lambdarank = _run_lambdarank(
+        "v1_basic + v2_recent + v3_relative (lambdarank)",
         all_train_df,
         all_val_df,
         ALL_FEATURE_COLUMNS,
@@ -399,8 +490,9 @@ def main(argv: list[str] | None = None) -> int:
     _print_metrics(run_v1)
     _print_metrics(run_combined)
     _print_metrics(run_all)
+    _print_metrics(run_lambdarank)
 
-    print("\n=== feature importance (v1_basic + v2_recent + v3_relative) ===")
+    print("\n=== feature importance (v1_basic + v2_recent + v3_relative, binary) ===")
     for row in feature_importance(run_all.booster).iter_rows(named=True):
         tag = (
             " [v3]" if row["feature"] in V3_FEATURE_COLUMNS
