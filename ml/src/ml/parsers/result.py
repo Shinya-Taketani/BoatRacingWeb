@@ -76,6 +76,13 @@ _DATE_RE = re.compile(r"第\s*\d+日\s+(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})")
 _RACE_HEADER_RE = re.compile(r"^\s*(\d{1,2})R\s+.*?H\d+m")
 _RACE_TIME_RE = re.compile(r"^(\d+)\.(\d{2})\.(\d)$")
 
+# 払戻金明細（自由形式）: 行頭に式別ラベルがある場合とない場合(複勝の2件目、
+# 拡連複の2・3件目)があるため、ラベル検出とフィールド抽出を分けて行う。
+# NFKC正規化後の行に対して使う（全角数字・全角スペース対策）。
+_PAYOUT_LABELS = ("単勝", "複勝", "2連単", "2連複", "拡連複", "3連単", "3連複")
+_PAYOUT_LABEL_RE = re.compile(r"^\s*(" + "|".join(_PAYOUT_LABELS) + r")\s*(.*)$")
+_PAYOUT_FIELD_RE = re.compile(r"(?P<combo>\d+(?:-\d+)*)\s+(?P<payout>\d+)(?:\s+人気\s+(?P<rank>\d+))?")
+
 
 class ResultParseError(ValueError):
     """競走成績(K)ファイルのパースに失敗した場合に送出する。"""
@@ -99,8 +106,22 @@ class RaceResultRecord:
 
 
 @dataclass(frozen=True)
+class PayoutRecord:
+    """払戻金明細1行（1式別×1組番）に対応するレコード。"""
+
+    stadium_code: int
+    race_date: date
+    race_no: int
+    bet_type: str  # 単勝/複勝/2連単/2連複/拡連複/3連単/3連複
+    combination: str  # 例: "3-5-2"（単勝/複勝は艇番単体 "3"）
+    payout: int  # 100円購入あたりの払戻金（円）
+    popularity_rank: int | None  # 人気順（単勝/複勝には無い）
+
+
+@dataclass(frozen=True)
 class ParsedResult:
     results: list[RaceResultRecord]
+    payouts: list[PayoutRecord]
 
 
 def parse_result_path(path) -> ParsedResult:
@@ -112,6 +133,7 @@ def parse_result_path(path) -> ParsedResult:
 def parse_result_bytes(raw: bytes) -> ParsedResult:
     lines = raw.split(b"\r\n")
     results: list[RaceResultRecord] = []
+    payouts: list[PayoutRecord] = []
     n = len(lines)
 
     def text_at(idx: int) -> str:
@@ -239,8 +261,10 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
                 )
             results.extend(race_results)
 
-            # 払戻金明細は自由形式のため、次のレース見出しか場終了マーカーまで読み飛ばす
+            # 払戻金明細は自由形式（式別ラベルが省略される行がある）なので、
+            # 次のレース見出しか場終了マーカーまで読み進めながらパースする。
             stadium_done = False
+            current_bet_type: str | None = None
             while True:
                 text = text_at(i)
                 end_m = _STADIUM_MARK_RE.match(text)
@@ -254,16 +278,42 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
                     break
                 if _RACE_HEADER_RE.match(normalized_at(i)):
                     break
+
+                normalized = normalized_at(i)
+                label_m = _PAYOUT_LABEL_RE.match(normalized)
+                if label_m:
+                    current_bet_type = label_m.group(1)
+                    remainder = label_m.group(2)
+                elif current_bet_type is not None:
+                    remainder = normalized
+                else:
+                    remainder = ""
+
+                if current_bet_type is not None:
+                    for field_m in _PAYOUT_FIELD_RE.finditer(remainder):
+                        rank = field_m.group("rank")
+                        payouts.append(
+                            PayoutRecord(
+                                stadium_code=stadium_code,
+                                race_date=race_date,
+                                race_no=race_no,
+                                bet_type=current_bet_type,
+                                combination=field_m.group("combo"),
+                                payout=int(field_m.group("payout")),
+                                popularity_rank=int(rank) if rank is not None else None,
+                            )
+                        )
+
                 i += 1
                 if i >= n:
                     raise ResultParseError(
-                        "unexpected end of file while skipping payout section"
+                        "unexpected end of file while parsing payout section"
                     )
 
             if stadium_done:
                 break
 
-    return ParsedResult(results=results)
+    return ParsedResult(results=results, payouts=payouts)
 
 
 def _parse_result_line(

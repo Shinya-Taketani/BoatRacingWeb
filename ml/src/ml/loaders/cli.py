@@ -1,13 +1,20 @@
-"""racer_daily_snapshots / racer_periods / races / race_entries / race_results 投入用CLI。
+"""racer_daily_snapshots / racer_periods / races / race_entries / race_results /
+payouts 投入用CLI。
 
 使い方:
     uv run python -m ml.loaders.cli load-program data/raw/B260916.TXT
     uv run python -m ml.loaders.cli compact-periods
     uv run python -m ml.loaders.cli compact-periods --rebuild
+    uv run python -m ml.loaders.cli load-races 2026-09-16
+    uv run python -m ml.loaders.cli load-results 2026-09-16
     uv run python -m ml.loaders.cli load-day 2026-09-16
 
 load-day は依存順（racer_daily_snapshots -> compact-periods ->
-races/race_entries -> race_results）を守って一括投入する。
+races/race_entries -> race_results -> payouts）を守って一括投入する。
+load-races（B）とload-results（K）に分かれているのは、結果確定前の朝の
+時点ではKファイルがまだ配信されておらずfetch_and_extractが失敗するため
+（data:catch-up からの欠損補完で、当日races/race_entriesはあるが
+race_results/payoutsはまだ、というケースを個別に扱えるようにしている）。
 """
 
 from __future__ import annotations
@@ -20,6 +27,8 @@ from pathlib import Path
 
 from ml.fetchers.mbrace import FetchError, fetch_and_extract
 from ml.loaders.db import get_connection
+from ml.loaders.payouts import LoaderError as PayoutLoaderError
+from ml.loaders.payouts import upsert_payouts
 from ml.loaders.races import LoaderError as RaceLoaderError
 from ml.loaders.races import upsert_races_and_entries
 from ml.loaders.racer_periods import CompactionError, compact_racer_periods
@@ -112,6 +121,33 @@ def _cmd_load_races(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_results_pipeline(conn, k_path: Path) -> None:
+    """race_results -> payouts。Kファイルのみで完結する（B/races不要だが、
+    対象race_entriesが既に投入済みであることが前提＝FKで担保される）。
+    """
+    parsed_result = parse_result_path(k_path)
+
+    result_load = upsert_race_results(conn, parsed_result)
+    print(f"race_results: upserted {result_load.results_upserted}")
+
+    payout_load = upsert_payouts(conn, parsed_result.payouts)
+    print(f"payouts: upserted {payout_load.payouts_upserted}")
+
+
+def _cmd_load_results(args: argparse.Namespace) -> int:
+    d = date.fromisoformat(args.date)
+    k_path = fetch_and_extract("K", d, _DATA_RAW_DIR, force=args.force)
+    print(f"fetched {k_path.name}")
+
+    conn = get_connection()
+    try:
+        _load_results_pipeline(conn, k_path)
+    finally:
+        conn.close()
+
+    return 0
+
+
 def _cmd_load_day(args: argparse.Namespace) -> int:
     d = date.fromisoformat(args.date)
 
@@ -122,10 +158,7 @@ def _cmd_load_day(args: argparse.Namespace) -> int:
     conn = get_connection()
     try:
         _load_program_pipeline(conn, b_path)
-
-        parsed_result = parse_result_path(k_path)
-        result_load = upsert_race_results(conn, parsed_result)
-        print(f"race_results: upserted {result_load.results_upserted}")
+        _load_results_pipeline(conn, k_path)
     finally:
         conn.close()
 
@@ -161,6 +194,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_races.set_defaults(func=_cmd_load_races)
 
+    p_results = sub.add_parser(
+        "load-results",
+        help="指定日のKのみ取得・パースし、race_results/payoutsへ投入（races/race_entriesは投入済み前提）",
+    )
+    p_results.add_argument("date", help="YYYY-MM-DD")
+    p_results.add_argument(
+        "--force", action="store_true", help="既に展開済みでも再ダウンロードする"
+    )
+    p_results.set_defaults(func=_cmd_load_results)
+
     p_day = sub.add_parser(
         "load-day", help="指定日のB/Kを取得・パースし、依存順で一括投入"
     )
@@ -179,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         CompactionError,
         RaceLoaderError,
         ResultLoaderError,
+        PayoutLoaderError,
         FetchError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)

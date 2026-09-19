@@ -31,6 +31,7 @@ import psycopg
 
 from ml.loaders.db import get_connection
 from ml.models.lgbm import predict_race_normalized
+from ml.models.tickets import marginal_top_n, plackett_luce_trifecta
 from ml.models.train import DEFAULT_MODEL_DIR
 
 STAGE = 1
@@ -191,11 +192,28 @@ def generate_predictions_for_range(
             races_inserted += len(chunk)
 
             chunk_result = result.filter(pl.col("race_id").is_in(chunk))
+
+            # p_top2/p_top3はprediction_entries挿入後は不変化トリガーで
+            # 更新できないため、挿入時にPlackett-Luce展開から確定させる。
+            p_top2_top3_by_race: dict[int, tuple[dict[int, float], dict[int, float]]] = {}
+            for race_id in chunk:
+                race_rows = chunk_result.filter(pl.col("race_id") == race_id)
+                p_first = dict(zip(race_rows["lane"].to_list(), race_rows["pred_prob"].to_list()))
+                perm_probs = plackett_luce_trifecta(p_first)
+                p_top2_top3_by_race[race_id] = (
+                    marginal_top_n(perm_probs, 2),
+                    marginal_top_n(perm_probs, 3),
+                )
+
             entry_values_sql = ", ".join(["(%s, %s, %s, %s, %s)"] * chunk_result.height)
             entry_params: list[object] = []
             for row in chunk_result.iter_rows(named=True):
                 prediction_id = prediction_id_by_race[row["race_id"]]
-                entry_params.extend([prediction_id, row["lane"], row["pred_prob"], None, None])
+                p_top2, p_top3 = p_top2_top3_by_race[row["race_id"]]
+                entry_params.extend([
+                    prediction_id, row["lane"], row["pred_prob"],
+                    p_top2[row["lane"]], p_top3[row["lane"]],
+                ])
 
             cur.execute(
                 f"""
