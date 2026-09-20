@@ -60,6 +60,7 @@ class DataCatchUp extends Command
         // 全期間まとめて最終状態に更新してからレポートする
         DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($from), Carbon::parse($to));
         $this->report($from, $to);
+        $this->reportTodayYesterday($to);
 
         return self::SUCCESS;
     }
@@ -160,5 +161,61 @@ class DataCatchUp extends Command
 
         Log::info('data:catch-up done: '.$stillMissing->count().' date(s) still missing races/results/payouts/predictions, '
             .$oddsGaps->count().' date(s) with incomplete odds');
+    }
+
+    /**
+     * 当日・前日だけを目立つ形で末尾に出すサマリ。過去日は「そのうち埋まる」
+     * 想定だが、前日分が翌朝になっても揃っていない場合はバッチ失敗の
+     * 強いシグナルなので、ログを流し読みしても気づけるようにする。
+     */
+    private function reportTodayYesterday(string $today): void
+    {
+        $yesterday = Carbon::parse($today)->subDay()->toDateString();
+
+        $this->line('');
+        $this->line(str_repeat('=', 60));
+        $this->line('  当日・前日サマリ');
+        $this->line(str_repeat('=', 60));
+
+        $this->summarizeDay('前日', $yesterday, strict: true);
+        $this->summarizeDay('当日', $today, strict: false);
+
+        $this->line(str_repeat('=', 60));
+    }
+
+    private function summarizeDay(string $label, string $date, bool $strict): void
+    {
+        $missing = DataCoverage::missingFieldsFor($date);
+
+        if ($missing === null) {
+            $this->error("  [NG] {$label}({$date}): data_coverageに記録がありません");
+            Log::error("data:catch-up: {$label}({$date}) has no data_coverage row");
+
+            return;
+        }
+
+        if ($missing === []) {
+            $this->info("  [OK] {$label}({$date}): races/results/payouts/predictions すべて揃っています");
+
+            return;
+        }
+
+        // 前日分はもう全部揃っているはずなので、何か欠けていれば厳格に警告する。
+        // 当日分は結果・払戻がレース終了までに確定していないのが正常なので、
+        // races/predictions（朝06:00-06:15のバッチで揃うはず）だけを見る。
+        $critical = DataCoverage::criticalGapsFor($date, $strict) ?? [];
+
+        if ($critical === []) {
+            $this->info(
+                "  [--] {$label}({$date}): races/predictionsは揃っています "
+                .'(results/payoutsはレース終了後に確定するため、未取得でも当日中は正常)'
+            );
+
+            return;
+        }
+
+        $list = implode(', ', $critical);
+        $this->error("  [NG] {$label}({$date}): {$list} が未取得です。バッチの失敗が疑われます");
+        Log::error("data:catch-up: {$label}({$date}) missing critical fields: {$list}");
     }
 }

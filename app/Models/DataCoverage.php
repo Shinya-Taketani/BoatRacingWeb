@@ -30,6 +30,50 @@ class DataCoverage extends Model
     ];
 
     /**
+     * races/results/payouts/predictions のうち欠けている項目名の一覧。
+     * data_coverageにその日の行自体が無ければnull（未チェック/未来日など）。
+     *
+     * @return list<string>|null
+     */
+    public static function missingFieldsFor(string $date): ?array
+    {
+        $row = self::find($date);
+
+        if ($row === null) {
+            return null;
+        }
+
+        return array_keys(array_filter([
+            'races' => ! $row->has_races,
+            'results' => ! $row->has_results,
+            'payouts' => ! $row->has_payouts,
+            'predictions' => ! $row->has_predictions,
+        ]));
+    }
+
+    /**
+     * その日について「バッチ失敗が疑われる」とみなせる欠損項目のみを返す。
+     * data_coverageの行が無ければnull（未チェック/未来日など。呼び出し側で
+     * 「記録なし」として別扱いすること）。
+     *
+     * strict=true（前日以前）: races/results/payouts/predictionsの全て。
+     * strict=false（当日）: races/predictionsのみ。results/payoutsはレース
+     * 終了までに確定していないのが正常なので対象外にする。
+     *
+     * @return list<string>|null
+     */
+    public static function criticalGapsFor(string $date, bool $strict): ?array
+    {
+        $missing = self::missingFieldsFor($date);
+
+        if ($missing === null) {
+            return null;
+        }
+
+        return $strict ? $missing : array_values(array_intersect($missing, ['races', 'predictions']));
+    }
+
+    /**
      * [$from, $to]（両端含む）の各日について、races/race_results/payouts/
      * predictions/odds_snapshots の実データを集計し直してdata_coverageを
      * upsertする。has_results/has_payouts/has_predictions は「その日の
