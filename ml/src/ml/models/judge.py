@@ -82,10 +82,13 @@ def main() -> int:
     finally:
         conn.close()
 
-    print(
-        f"judged={result.judged_count} hit={result.hit_count} "
-        f"hit_rate={result.hit_rate:.4f} ({result.hit_rate * 100:.2f}%)"
-    )
+    if result.judged_count:
+        print(
+            f"judged={result.judged_count} hit={result.hit_count} "
+            f"hit_rate={result.hit_rate:.4f} ({result.hit_rate * 100:.2f}%)"
+        )
+    else:
+        print("judged=0 hit=0 (対象なし)")
     return 0
 
 

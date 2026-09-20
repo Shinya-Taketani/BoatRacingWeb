@@ -57,6 +57,13 @@ class DataCatchUp extends Command
             $this->fillDate($date, $modelVersion, $stage);
         }
 
+        // race_resultsを取り込んだ直後に判定まで済ませる。23:30の日次バッチを
+        // 逃しても翌朝の起動時に埋まるようにする。judge側は「結果確定済みかつ
+        // 未判定」のものだけを対象にするため、日次バッチと重複実行しても無害。
+        $this->line('未判定の予測を判定します -> predictions:judge を実行');
+        $judgeExit = $this->call('predictions:judge');
+        Log::info("data:catch-up: predictions:judge exit={$judgeExit}");
+
         // 全期間まとめて最終状態に更新してからレポートする
         DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($from), Carbon::parse($to));
         $this->report($from, $to);
