@@ -34,7 +34,7 @@ class FeaturesGenerateToday extends Command
 
             $result = Process::path(base_path('ml'))
                 ->timeout(300)
-                ->run(['uv', 'run', 'python', '-m', $module, $date, '--show', '0']);
+                ->run([config('ml.uv_binary'), 'run', 'python', '-m', $module, $date, '--show', '0']);
 
             foreach (explode("\n", trim($result->output())) as $line) {
                 if ($line !== '') {

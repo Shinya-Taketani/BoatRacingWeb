@@ -48,7 +48,7 @@ class PredictionsGenerateToday extends Command
 
         $result = Process::path(base_path('ml'))
             ->timeout(300)
-            ->run(['uv', 'run', 'python', '-m', 'ml.models.predict', $modelVersion, $date]);
+            ->run([config('ml.uv_binary'), 'run', 'python', '-m', 'ml.models.predict', $modelVersion, $date]);
 
         foreach (explode("\n", trim($result->output())) as $line) {
             if ($line !== '') {

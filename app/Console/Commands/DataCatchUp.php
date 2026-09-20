@@ -83,7 +83,7 @@ class DataCatchUp extends Command
 
             $result = Process::path(base_path('ml'))
                 ->timeout(120)
-                ->run(['uv', 'run', 'python', '-m', 'ml.loaders.cli', 'load-results', $date]);
+                ->run([config('ml.uv_binary'), 'run', 'python', '-m', 'ml.loaders.cli', 'load-results', $date]);
 
             foreach (explode("\n", trim($result->output())) as $line) {
                 if ($line !== '') {

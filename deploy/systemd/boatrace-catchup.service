@@ -7,12 +7,6 @@ Wants=postgresql.service
 Type=oneshot
 User=shinya
 WorkingDirectory=/var/www/BoatRacingWeb
-# uv は /home/shinya/.local/bin にインストールされており、対話シェルでは
-# .bashrc 等でPATHに追加されるが、systemdのデフォルトPATHには含まれない。
-# data:catch-up 配下のml呼び出し(Process::run(['uv', ...]))が
-# 「sh: 1: exec: uv: not found」で全滅していたため明示的に追加する
-# （2026-09-21、実運用ログで発覚）。
-Environment="PATH=/home/shinya/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 ExecStart=/usr/bin/php artisan data:catch-up
 StandardOutput=journal
 StandardError=journal
