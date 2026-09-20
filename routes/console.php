@@ -23,9 +23,16 @@ Schedule::command('odds:schedule-today')
     ->timezone(config('app.race_timezone'));
 
 // レース一覧の取り込み(06:00)の後、当日分の特徴量生成→推論を行い、
-// predictions/prediction_entries に書き込む。
+// predictions/prediction_entries に書き込む。買い目生成(tickets:generate-today)
+// はpredictions:generate-todayの中でも続けて呼ばれるが、依存関係が明確な
+// 処理を2箇所に分けておくことで、万一チェーン側が失敗した場合でも
+// 06:15の単独実行で拾えるようにする（tickets側は生成済みレースをスキップ
+// するため、二重実行しても無害）。
 Schedule::command('predictions:generate-today')
     ->dailyAt('06:10')
+    ->timezone(config('app.race_timezone'));
+Schedule::command('tickets:generate-today')
+    ->dailyAt('06:15')
     ->timezone(config('app.race_timezone'));
 
 // その日の全レース終了後、結果が確定した予測をまとめて判定する。

@@ -8,7 +8,9 @@ use Illuminate\Support\Facades\Process;
 
 /**
  * 当日分の特徴量(v1/v2/v3)を生成した上で、保存済みモデルで推論し、
- * predictions / prediction_entries に書き込む。
+ * predictions / prediction_entries に書き込む。続けて3連単の買い目
+ * (tickets:generate-today)も生成する（predictions -> tickets の依存関係が
+ * 明確なため、ここでまとめて実行する）。
  *
  * stage は当面1のみ（締切直前の再予測=stage2は未実装）。
  */
@@ -56,6 +58,16 @@ class PredictionsGenerateToday extends Command
 
         if ($result->failed()) {
             $this->error(trim($result->errorOutput()));
+
+            return self::FAILURE;
+        }
+
+        $ticketsExit = $this->call('tickets:generate-today', [
+            'date' => $date,
+            '--model-version' => $modelVersion,
+        ]);
+        if ($ticketsExit !== self::SUCCESS) {
+            $this->error('買い目生成に失敗しました。');
 
             return self::FAILURE;
         }

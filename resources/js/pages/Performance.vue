@@ -49,6 +49,12 @@ onMounted(async () => {
                 </div>
             </div>
 
+            <p class="mb-8 text-sm text-slate-500">
+                1レースあたり平均: 買い目{{ summary.overall.avg_tickets_per_race }}点
+                / 購入{{ summary.overall.avg_stake_per_race?.toLocaleString() }}円
+                / 払戻{{ summary.overall.avg_payout_per_race?.toLocaleString() }}円
+            </p>
+
             <h2 class="mb-2 text-sm font-semibold text-slate-500">月別</h2>
             <div class="overflow-x-auto rounded-lg border border-slate-200 bg-white">
                 <table class="w-full min-w-[560px] text-sm">
@@ -74,6 +80,10 @@ onMounted(async () => {
                     </tbody>
                 </table>
             </div>
+
+            <p class="mt-4 text-xs leading-relaxed text-slate-400">
+                回収率は公営競技の控除率（約25%）とほぼ同水準です。買い続けた場合、長期的には購入額の約25%が減少します。本サービスは的中率を高めるための情報提供であり、利益を保証するものではありません。
+            </p>
         </div>
     </div>
 </template>

@@ -61,7 +61,7 @@ _OFF_NATIONAL_WIN_RATE_2 = slice(30, 35)
 _OFF_LOCAL_WIN_RATE = slice(36, 40)
 _OFF_LOCAL_WIN_RATE_2 = slice(41, 46)
 _OFF_MOTOR_NO = slice(47, 49)
-_OFF_MOTOR_WIN_RATE_2 = slice(51, 55)
+_OFF_MOTOR_WIN_RATE_2 = slice(50, 55)
 _OFF_BOAT_NO = slice(56, 58)
 _OFF_BOAT_WIN_RATE_2 = slice(59, 64)
 

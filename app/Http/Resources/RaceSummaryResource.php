@@ -26,6 +26,14 @@ class RaceSummaryResource extends JsonResource
             : [];
 
         $normalizedEntropy = ConfidenceGrader::normalizedEntropy($pFirstByLane);
+        $topLane = ConfidenceGrader::topLane($pFirstByLane);
+
+        // 結果はrace_results由来（predictions:judgeの日次バッチを待たず、
+        // 締切後すぐに「実際の1着」「予測が当たったか」を出せるようにする）。
+        $winnerEntry = $this->raceEntries->first(
+            fn ($entry) => $entry->result?->finish_pos === 1
+        );
+        $resultAvailable = $this->raceEntries->contains(fn ($entry) => $entry->result !== null);
 
         return [
             'id' => $this->id,
@@ -34,8 +42,16 @@ class RaceSummaryResource extends JsonResource
             'deadline_at' => $this->deadline_at?->toIso8601String(),
             'title' => $this->title,
             'predicted_probabilities' => $pFirstByLane !== [] ? $pFirstByLane : null,
+            'top_lane' => $topLane,
             'confidence_grade' => ConfidenceGrader::grade($normalizedEntropy),
             'lane1_risk' => ConfidenceGrader::lane1Risk($pFirstByLane),
+            'lane1_risk_level' => ConfidenceGrader::lane1RiskLevel($pFirstByLane),
+            'is_upset_pick' => ConfidenceGrader::isUpsetPick($pFirstByLane),
+            'result_available' => $resultAvailable,
+            'actual_winner_lane' => $winnerEntry?->lane,
+            'predicted_hit' => ($topLane !== null && $winnerEntry !== null)
+                ? $topLane === $winnerEntry->lane
+                : null,
         ];
     }
 }

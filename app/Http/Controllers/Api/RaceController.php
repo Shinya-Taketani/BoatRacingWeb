@@ -13,7 +13,7 @@ class RaceController extends Controller
 {
     public function today(): AnonymousResourceCollection
     {
-        $races = Race::with(['stadium', 'prediction.entries'])
+        $races = Race::with(['stadium', 'prediction.entries', 'raceEntries.result'])
             ->whereDate('race_date', RaceDate::today())
             ->orderBy('deadline_at')
             ->get();

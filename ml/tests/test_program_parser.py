@@ -87,6 +87,20 @@ def test_known_entry_lane1_race1_karatsu(parsed):
     assert entry.boat_win_rate_2 == Decimal("28.81")
 
 
+def test_motor_win_rate_2_two_digit_value_not_truncated(parsed):
+    """motor_win_rate_2が10%以上(十の位あり)のケース。過去に_OFF_MOTOR_WIN_RATE_2の
+    バイトオフセットが1つずれており、十の位が欠落するバグがあった
+    （例: 22.11 -> 2.11）。上の0.00のような1桁の値ではこのバグを検出できない
+    ため、2桁のケースを別途固定する。
+    """
+    entry = next(e for e in parsed.entries if e.racer.registration_number == 4856)
+
+    assert entry.motor_no == 24
+    assert entry.motor_win_rate_2 == Decimal("22.11")
+    assert entry.boat_no == 46
+    assert entry.boat_win_rate_2 == Decimal("27.45")
+
+
 def test_all_entries_have_valid_racer_class(parsed):
     valid = {"A1", "A2", "B1", "B2"}
     assert all(e.racer.racer_class in valid for e in parsed.entries)

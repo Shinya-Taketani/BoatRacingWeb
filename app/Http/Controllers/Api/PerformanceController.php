@@ -40,7 +40,8 @@ class PerformanceController extends Controller
         );
 
         $recovery = DB::selectOne(
-            'SELECT count(t.id) * 100 AS stake, coalesce(sum(po.payout), 0) AS payout
+            'SELECT count(DISTINCT t.prediction_id) AS ticket_races,
+                    count(t.id) * 100 AS stake, coalesce(sum(po.payout), 0) AS payout
              FROM prediction_tickets t
              JOIN predictions p ON p.id = t.prediction_id
              LEFT JOIN payouts po
@@ -49,7 +50,7 @@ class PerformanceController extends Controller
             [$modelVersion, $stage, self::BET_TYPE]
         );
 
-        return $this->formatRow($hit->races, $hit->hits, $recovery->stake, $recovery->payout);
+        return $this->formatRow($hit->races, $hit->hits, $recovery->ticket_races, $recovery->stake, $recovery->payout);
     }
 
     private function monthlyRows(?string $modelVersion, int $stage): array
@@ -58,6 +59,7 @@ class PerformanceController extends Controller
             "SELECT to_char(r.race_date, 'YYYY-MM') AS month,
                     count(DISTINCT pj.prediction_id) AS races,
                     count(DISTINCT pj.prediction_id) FILTER (WHERE pj.hit) AS hits,
+                    count(stake_agg.prediction_id) AS ticket_races,
                     coalesce(sum(stake_agg.stake), 0) AS stake,
                     coalesce(sum(stake_agg.payout), 0) AS payout
              FROM predictions p
@@ -81,20 +83,30 @@ class PerformanceController extends Controller
         );
 
         return array_map(
-            fn ($row) => ['month' => $row->month, ...$this->formatRow($row->races, $row->hits, $row->stake, $row->payout)],
+            fn ($row) => [
+                'month' => $row->month,
+                ...$this->formatRow($row->races, $row->hits, $row->ticket_races, $row->stake, $row->payout),
+            ],
             $rows
         );
     }
 
-    private function formatRow(int $races, int $hits, int $stake, int $payout): array
+    private function formatRow(int $races, int $hits, int $ticketRaces, int $stake, int $payout): array
     {
+        $tickets = $stake > 0 ? intdiv($stake, 100) : 0;
+
         return [
             'races' => $races,
             'hit_rate' => $races > 0 ? round($hits / $races, 4) : null,
-            'tickets' => $stake > 0 ? intdiv($stake, 100) : 0,
+            'tickets' => $tickets,
             'stake' => $stake,
             'payout' => $payout,
             'recovery_rate' => $stake > 0 ? round($payout / $stake, 4) : null,
+            // 「1レースあたり平均」（3,416万円より、1レース850円買って平均640円戻る
+            // という粒度の方が実感が湧く、という理由で追加）
+            'avg_tickets_per_race' => $ticketRaces > 0 ? round($tickets / $ticketRaces, 2) : null,
+            'avg_stake_per_race' => $ticketRaces > 0 ? round($stake / $ticketRaces, 1) : null,
+            'avg_payout_per_race' => $ticketRaces > 0 ? round($payout / $ticketRaces, 1) : null,
         ];
     }
 }
