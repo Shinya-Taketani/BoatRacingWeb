@@ -31,12 +31,16 @@ Schedule::command('odds:schedule-today')
     ->dailyAt('06:05')
     ->timezone(config('app.race_timezone'))
     ->appendOutputTo($scheduleLog);
-// 直前情報(展示タイム等)も同じdispatch()->delay()方式で締切T-12に予約する。
-// 当面は記録のみで学習には使わない（CLAUDE.md参照）。
-Schedule::command('beforeinfo:schedule-today')
-    ->dailyAt('06:06')
-    ->timezone(config('app.race_timezone'))
-    ->appendOutputTo($scheduleLog);
+// 直前情報(展示タイム等)の自動取得(beforeinfo:schedule-today)は
+// 2026-09-21、boatrace.jpのサイトポリシー「禁止事項について」5.
+// （不正アクセス、大量の情報送受信及び大量のアクセスなど、本サイトの
+// 運営に支障を与える行為）に抵触しないか財団に確認するまで停止する。
+// コマンド自体・スクレイパー・テーブルは残してあるので、許諾が取れ次第
+// このスケジュール登録を復活させればよい。CLAUDE.md参照。
+// Schedule::command('beforeinfo:schedule-today')
+//     ->dailyAt('06:06')
+//     ->timezone(config('app.race_timezone'))
+//     ->appendOutputTo($scheduleLog);
 
 // レース一覧の取り込み(06:00)の後、当日分の特徴量生成→推論を行い、
 // predictions/prediction_entries に書き込む。買い目生成(tickets:generate-today)
