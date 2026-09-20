@@ -1,0 +1,15 @@
+[Unit]
+Description=BoatRacingWeb data catch-up (races/race_results/payouts/predictions)
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=shinya
+WorkingDirectory=/var/www/BoatRacingWeb
+ExecStart=/usr/bin/php artisan data:catch-up
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
