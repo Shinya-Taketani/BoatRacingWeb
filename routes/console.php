@@ -31,6 +31,12 @@ Schedule::command('odds:schedule-today')
     ->dailyAt('06:05')
     ->timezone(config('app.race_timezone'))
     ->appendOutputTo($scheduleLog);
+// 直前情報(展示タイム等)も同じdispatch()->delay()方式で締切T-12に予約する。
+// 当面は記録のみで学習には使わない（CLAUDE.md参照）。
+Schedule::command('beforeinfo:schedule-today')
+    ->dailyAt('06:06')
+    ->timezone(config('app.race_timezone'))
+    ->appendOutputTo($scheduleLog);
 
 // レース一覧の取り込み(06:00)の後、当日分の特徴量生成→推論を行い、
 // predictions/prediction_entries に書き込む。買い目生成(tickets:generate-today)
