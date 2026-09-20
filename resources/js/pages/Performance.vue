@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { fetchPerformance } from '../api';
 import { formatPercent } from '../format';
 
@@ -16,6 +16,11 @@ onMounted(async () => {
         loading.value = false;
     }
 });
+
+// daily は日付降順(JST基準、サーバ側のRaceDate::todayで算出)で返るため、
+// 先頭が当日・2番目が前日になる。ブラウザのローカルタイムゾーンでの日付
+// 計算はJSTとずれる可能性があるため使わない。
+const yesterday = computed(() => summary.value?.daily?.[1] ?? null);
 </script>
 
 <template>
@@ -47,6 +52,13 @@ onMounted(async () => {
                         {{ summary.overall.stake.toLocaleString() }}円 / {{ summary.overall.payout.toLocaleString() }}円
                     </p>
                 </div>
+                <div class="rounded-lg border border-slate-200 bg-white p-4">
+                    <p class="text-xs text-slate-500">
+                        昨日の的中率<span v-if="yesterday" class="ml-1 text-slate-400">({{ yesterday.date }})</span>
+                    </p>
+                    <p class="text-2xl font-semibold">{{ formatPercent(yesterday?.hit_rate) }}</p>
+                    <p class="text-xs text-slate-400">対象{{ (yesterday?.races ?? 0).toLocaleString() }}レース</p>
+                </div>
             </div>
 
             <p class="mb-8 text-sm text-slate-500">
@@ -54,6 +66,37 @@ onMounted(async () => {
                 / 購入{{ summary.overall.avg_stake_per_race?.toLocaleString() }}円
                 / 払戻{{ summary.overall.avg_payout_per_race?.toLocaleString() }}円
             </p>
+
+            <h2 class="mb-2 text-sm font-semibold text-slate-500">日別（直近30日）</h2>
+            <div class="mb-8 overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                <table class="w-full min-w-[560px] text-sm">
+                    <thead class="bg-slate-50 text-left text-xs text-slate-500">
+                        <tr>
+                            <th class="px-3 py-2">日付</th>
+                            <th class="px-3 py-2">レース数</th>
+                            <th class="px-3 py-2">的中率</th>
+                            <th class="px-3 py-2">購入額</th>
+                            <th class="px-3 py-2">払戻額</th>
+                            <th class="px-3 py-2">回収率</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr
+                            v-for="row in summary.daily"
+                            :key="row.date"
+                            class="border-t border-slate-100"
+                            :class="row.races === 0 ? 'bg-slate-50 text-slate-400' : ''"
+                        >
+                            <td class="px-3 py-2 font-medium">{{ row.date }}</td>
+                            <td class="px-3 py-2">{{ row.races.toLocaleString() }}</td>
+                            <td class="px-3 py-2">{{ formatPercent(row.hit_rate) }}</td>
+                            <td class="px-3 py-2">{{ row.stake.toLocaleString() }}円</td>
+                            <td class="px-3 py-2">{{ row.payout.toLocaleString() }}円</td>
+                            <td class="px-3 py-2">{{ formatPercent(row.recovery_rate) }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
 
             <h2 class="mb-2 text-sm font-semibold text-slate-500">月別</h2>
             <div class="overflow-x-auto rounded-lg border border-slate-200 bg-white">

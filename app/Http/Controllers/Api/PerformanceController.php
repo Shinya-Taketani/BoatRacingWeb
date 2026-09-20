@@ -3,7 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Support\RaceDate;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -25,6 +27,7 @@ class PerformanceController extends Controller
         return response()->json([
             'model_version' => $modelVersion,
             'overall' => $this->summaryRow($modelVersion, $stage),
+            'daily' => $this->dailyRows($modelVersion, $stage),
             'monthly' => $this->monthlyRows($modelVersion, $stage),
         ]);
     }
@@ -51,6 +54,72 @@ class PerformanceController extends Controller
         );
 
         return $this->formatRow($hit->races, $hit->hits, $recovery->ticket_races, $recovery->stake, $recovery->payout);
+    }
+
+    /**
+     * 直近30日。predictions起点だとバッチが丸ごと失敗した日(races はあるが
+     * predictionsが1件も無い)が結果から消えてしまいバッチ失敗検知に使えない
+     * ため、races起点で日付を確定させ、predictions/judgments/ticketsは
+     * LEFT JOINで無ければ0件として出す。
+     */
+    private function dailyRows(?string $modelVersion, int $stage): array
+    {
+        $end = RaceDate::today();
+        $start = Carbon::parse($end)->subDays(29)->toDateString();
+
+        $rows = DB::select(
+            "WITH race_days AS (
+                 SELECT race_date FROM races
+                 WHERE race_date BETWEEN ? AND ?
+                 GROUP BY race_date
+             ),
+             judgment_agg AS (
+                 SELECT r.race_date,
+                        count(DISTINCT pj.prediction_id) AS races,
+                        count(DISTINCT pj.prediction_id) FILTER (WHERE pj.hit) AS hits
+                 FROM predictions p
+                 JOIN races r ON r.id = p.race_id
+                 JOIN prediction_judgments pj ON pj.prediction_id = p.id
+                 WHERE p.model_version = ? AND p.stage = ? AND r.race_date BETWEEN ? AND ?
+                 GROUP BY r.race_date
+             ),
+             ticket_agg AS (
+                 SELECT r.race_date,
+                        count(DISTINCT t.prediction_id) AS ticket_races,
+                        count(t.id) * 100 AS stake,
+                        coalesce(sum(po.payout), 0) AS payout
+                 FROM predictions p
+                 JOIN races r ON r.id = p.race_id
+                 JOIN prediction_tickets t ON t.prediction_id = p.id AND t.bet_type = ?
+                 LEFT JOIN payouts po
+                     ON po.race_id = p.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
+                 WHERE p.model_version = ? AND p.stage = ? AND r.race_date BETWEEN ? AND ?
+                 GROUP BY r.race_date
+             )
+             SELECT to_char(rd.race_date, 'YYYY-MM-DD') AS date,
+                    coalesce(ja.races, 0) AS races,
+                    coalesce(ja.hits, 0) AS hits,
+                    coalesce(ta.ticket_races, 0) AS ticket_races,
+                    coalesce(ta.stake, 0) AS stake,
+                    coalesce(ta.payout, 0) AS payout
+             FROM race_days rd
+             LEFT JOIN judgment_agg ja ON ja.race_date = rd.race_date
+             LEFT JOIN ticket_agg ta ON ta.race_date = rd.race_date
+             ORDER BY rd.race_date DESC",
+            [
+                $start, $end,
+                $modelVersion, $stage, $start, $end,
+                self::BET_TYPE, $modelVersion, $stage, $start, $end,
+            ]
+        );
+
+        return array_map(
+            fn ($row) => [
+                'date' => $row->date,
+                ...$this->formatRow($row->races, $row->hits, $row->ticket_races, $row->stake, $row->payout),
+            ],
+            $rows
+        );
     }
 
     private function monthlyRows(?string $modelVersion, int $stage): array
