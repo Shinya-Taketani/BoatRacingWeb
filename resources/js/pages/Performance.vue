@@ -90,9 +90,15 @@ const yesterday = computed(() => summary.value?.daily?.[1] ?? null);
                             <td class="px-3 py-2 font-medium">{{ row.date }}</td>
                             <td class="px-3 py-2">{{ row.races.toLocaleString() }}</td>
                             <td class="px-3 py-2">{{ formatPercent(row.hit_rate) }}</td>
-                            <td class="px-3 py-2">{{ row.stake.toLocaleString() }}円</td>
-                            <td class="px-3 py-2">{{ row.payout.toLocaleString() }}円</td>
-                            <td class="px-3 py-2">{{ formatPercent(row.recovery_rate) }}</td>
+                            <td class="px-3 py-2">{{ row.stake > 0 ? `${row.stake.toLocaleString()}円` : '-' }}</td>
+                            <template v-if="row.races === 0">
+                                <td class="px-3 py-2">集計中</td>
+                                <td class="px-3 py-2">集計中</td>
+                            </template>
+                            <template v-else>
+                                <td class="px-3 py-2">{{ row.payout.toLocaleString() }}円</td>
+                                <td class="px-3 py-2">{{ formatPercent(row.recovery_rate) }}</td>
+                            </template>
                         </tr>
                     </tbody>
                 </table>
