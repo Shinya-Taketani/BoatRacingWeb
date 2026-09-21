@@ -24,9 +24,13 @@ class RaceSummaryResource extends JsonResource
         $pFirstByLane = $prediction
             ? $prediction->entries->pluck('p_first', 'lane')->all()
             : [];
+        $pTop3ByLane = $prediction
+            ? $prediction->entries->pluck('p_top3', 'lane')->all()
+            : [];
 
         $normalizedEntropy = ConfidenceGrader::normalizedEntropy($pFirstByLane);
         $topLane = ConfidenceGrader::topLane($pFirstByLane);
+        $confidentTop3 = ConfidenceGrader::confidentTop3($pTop3ByLane);
 
         // 結果はrace_results由来（predictions:judgeの日次バッチを待たず、
         // 締切後すぐに「実際の1着」「予測が当たったか」を出せるようにする）。
@@ -47,6 +51,8 @@ class RaceSummaryResource extends JsonResource
             'lane1_risk' => ConfidenceGrader::lane1Risk($pFirstByLane),
             'lane1_risk_level' => ConfidenceGrader::lane1RiskLevel($pFirstByLane),
             'is_upset_pick' => ConfidenceGrader::isUpsetPick($pFirstByLane),
+            'confident_top3_lane' => $confidentTop3['lane'] ?? null,
+            'confident_top3_prob' => $confidentTop3['p_top3'] ?? null,
             'result_available' => $resultAvailable,
             'actual_winner_lane' => $winnerEntry?->lane,
             'predicted_hit' => ($topLane !== null && $winnerEntry !== null)

@@ -9,3 +9,4 @@ use Illuminate\Support\Facades\Route;
 Route::get('/races/today', [RaceController::class, 'today']);
 Route::get('/races/{race}', [RaceController::class, 'show']);
 Route::get('/performance', [PerformanceController::class, 'index']);
+Route::get('/performance/confident-top3', [PerformanceController::class, 'confidentTop3']);

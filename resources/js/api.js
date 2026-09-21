@@ -23,3 +23,8 @@ export function fetchRace(id) {
 export function fetchPerformance() {
     return request('/performance');
 }
+
+export function fetchConfidentTop3Performance(threshold) {
+    const query = threshold ? `?threshold=${threshold}` : '';
+    return request(`/performance/confident-top3${query}`);
+}

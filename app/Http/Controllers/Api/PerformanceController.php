@@ -160,6 +160,121 @@ class PerformanceController extends Controller
         );
     }
 
+    /**
+     * 「3着内確実な艇」(config('ml.top3_confident_threshold')、軸艇)の的中率を
+     * 日別・月別に集計する。races起点(dailyRows()と同じ理由)で、predictionsが
+     * 無い日・該当艇が無いレースも0件として自然に出す。
+     */
+    public function confidentTop3(): JsonResponse
+    {
+        $modelVersion = config('ml.prediction_model_version');
+        $stage = config('ml.prediction_stage');
+        $options = config('ml.top3_confident_threshold_options');
+
+        $threshold = (float) request()->query('threshold', config('ml.top3_confident_threshold'));
+        if (! in_array($threshold, $options, true)) {
+            $threshold = config('ml.top3_confident_threshold');
+        }
+
+        return response()->json([
+            'model_version' => $modelVersion,
+            'threshold' => $threshold,
+            'threshold_options' => $options,
+            'overall' => $this->confidentTop3Overall($modelVersion, $stage, $threshold),
+            'daily' => $this->confidentTop3Rows($modelVersion, $stage, $threshold, 'day'),
+            'monthly' => $this->confidentTop3Rows($modelVersion, $stage, $threshold, 'month'),
+        ]);
+    }
+
+    private function confidentTop3Overall(?string $modelVersion, int $stage, float $threshold): array
+    {
+        $row = DB::selectOne(
+            'WITH top_picks AS (
+                 SELECT p.race_id, pe.lane, pe.p_top3,
+                        rank() OVER (PARTITION BY p.race_id ORDER BY pe.p_top3 DESC) AS rnk
+                 FROM prediction_entries pe
+                 JOIN predictions p ON p.id = pe.prediction_id
+                 WHERE p.model_version = ? AND p.stage = ?
+             ),
+             confident_picks AS (
+                 SELECT race_id, lane FROM top_picks WHERE rnk = 1 AND p_top3 >= ?
+             )
+             SELECT count(rr.race_entry_id) AS n_confident,
+                    count(rr.race_entry_id) FILTER (WHERE rr.finish_pos <= 3) AS n_hit
+             FROM confident_picks cp
+             JOIN race_entries re ON re.race_id = cp.race_id AND re.lane = cp.lane
+             JOIN race_results rr ON rr.race_entry_id = re.id',
+            [$modelVersion, $stage, $threshold]
+        );
+
+        return $this->formatConfidentRow((int) $row->n_confident, (int) $row->n_hit);
+    }
+
+    private function confidentTop3Rows(?string $modelVersion, int $stage, float $threshold, string $granularity): array
+    {
+        $dateExpr = $granularity === 'month' ? "to_char(race_date, 'YYYY-MM')" : "to_char(race_date, 'YYYY-MM-DD')";
+        $keyName = $granularity === 'month' ? 'month' : 'date';
+
+        // dailyRows()と同じ方針: 日別は直近30日、月別は全期間。
+        $raceWhere = '';
+        $raceDaysParams = [];
+        if ($granularity === 'day') {
+            $end = RaceDate::today();
+            $start = Carbon::parse($end)->subDays(29)->toDateString();
+            $raceWhere = 'WHERE race_date BETWEEN ? AND ?';
+            $raceDaysParams = [$start, $end];
+        }
+
+        $rows = DB::select(
+            "WITH race_days AS (
+                 SELECT DISTINCT {$dateExpr} AS bucket FROM races {$raceWhere}
+             ),
+             top_picks AS (
+                 SELECT r.race_date, p.race_id, pe.lane, pe.p_top3,
+                        rank() OVER (PARTITION BY p.race_id ORDER BY pe.p_top3 DESC) AS rnk
+                 FROM prediction_entries pe
+                 JOIN predictions p ON p.id = pe.prediction_id
+                 JOIN races r ON r.id = p.race_id
+                 WHERE p.model_version = ? AND p.stage = ?
+             ),
+             confident_picks AS (
+                 SELECT race_date, race_id, lane FROM top_picks WHERE rnk = 1 AND p_top3 >= ?
+             ),
+             judged AS (
+                 SELECT {$dateExpr} AS bucket,
+                        (rr.finish_pos <= 3) AS hit
+                 FROM confident_picks cp
+                 JOIN race_entries re ON re.race_id = cp.race_id AND re.lane = cp.lane
+                 JOIN race_results rr ON rr.race_entry_id = re.id
+             )
+             SELECT rd.bucket,
+                    count(j.hit) AS n_confident,
+                    count(j.hit) FILTER (WHERE j.hit) AS n_hit
+             FROM race_days rd
+             LEFT JOIN judged j ON j.bucket = rd.bucket
+             GROUP BY rd.bucket
+             ORDER BY rd.bucket DESC",
+            [...$raceDaysParams, $modelVersion, $stage, $threshold]
+        );
+
+        return array_map(
+            fn ($row) => [
+                $keyName => $row->bucket,
+                ...$this->formatConfidentRow((int) $row->n_confident, (int) $row->n_hit),
+            ],
+            $rows
+        );
+    }
+
+    private function formatConfidentRow(int $nConfident, int $nHit): array
+    {
+        return [
+            'confident_races' => $nConfident,
+            'hit' => $nHit,
+            'hit_rate' => $nConfident > 0 ? round($nHit / $nConfident, 4) : null,
+        ];
+    }
+
     private function formatRow(int $races, int $hits, int $ticketRaces, int $stake, int $payout): array
     {
         $tickets = $stake > 0 ? intdiv($stake, 100) : 0;

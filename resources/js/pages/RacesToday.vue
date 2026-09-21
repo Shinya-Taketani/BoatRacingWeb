@@ -43,6 +43,12 @@ const sortedByDeadline = computed(() =>
     [...races.value].sort((a, b) => new Date(a.deadline_at) - new Date(b.deadline_at))
 );
 
+// 3着内確実な艇: p_top3がconfig('ml.top3_confident_threshold')(現在96%)以上の艇。
+// 締切が近い順に最大10件。
+const confidentTop3Races = computed(() =>
+    sortedByDeadline.value.filter((r) => r.confident_top3_lane !== null && !isPast(r)).slice(0, 10)
+);
+
 // A. 堅いレース: 1号艇本命 かつ confidence_grade=S（手堅く当てたい人向け）
 const safeRaces = computed(() =>
     sortedByDeadline.value
@@ -87,6 +93,32 @@ const groupedListByStadium = computed(() => {
         <p v-else-if="error" class="text-red-600">読み込みに失敗しました: {{ error }}</p>
 
         <div v-else class="space-y-10">
+            <!-- 0. 3着内確実な艇 -->
+            <section v-if="confidentTop3Races.length > 0">
+                <h2 class="mb-1 text-lg font-semibold">3着内確実な艇</h2>
+                <p class="mb-3 text-xs text-slate-500">
+                    3着以内に入る確率が96%以上の艇。検証期間で実績90.4%（22,429艇中20,270艇的中）。
+                </p>
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    <div
+                        v-for="race in confidentTop3Races"
+                        :key="race.id"
+                        class="cursor-pointer rounded-xl border-2 border-sky-200 bg-sky-50 p-4 transition hover:border-sky-400"
+                        @click="$router.push(`/races/${race.id}`)"
+                    >
+                        <div class="flex items-center justify-between">
+                            <span class="font-semibold text-slate-800">{{ race.stadium_name }} {{ race.race_no }}R</span>
+                            <span class="text-xs text-slate-500">締切 {{ formatTime(race.deadline_at) }}</span>
+                        </div>
+                        <p class="mt-3 text-2xl font-bold text-sky-700">
+                            {{ race.confident_top3_lane }}号艇
+                            <span class="text-base font-normal text-sky-600">{{ formatPercent(race.confident_top3_prob) }}</span>
+                        </p>
+                        <p class="text-xs text-slate-500">3着以内</p>
+                    </div>
+                </div>
+            </section>
+
             <!-- 1B. 妙味のあるレース（モデルの判断が際立つレース） -->
             <section v-if="upsetRaces.length > 0">
                 <h2 class="mb-1 text-lg font-semibold">妙味のあるレース</h2>

@@ -119,4 +119,31 @@ class ConfidenceGrader
 
         return $pFirstByLane[$topLane] >= config('ml.upset_pick_threshold');
     }
+
+    /**
+     * p_top3(3着以内に入る確率)が最も高い艇の (lane, p_top3) を返す。
+     * その最大値が閾値未満、またはp_top3が1つも無ければnullを返す
+     * （「3着内確実な艇」＝軸艇の判定。閾値省略時はconfig('ml.top3_confident_threshold')）。
+     *
+     * @param  array<int, float|null>  $pTop3ByLane
+     * @return array{lane: int, p_top3: float}|null
+     */
+    public static function confidentTop3(array $pTop3ByLane, ?float $threshold = null): ?array
+    {
+        $threshold ??= config('ml.top3_confident_threshold');
+
+        $probs = array_filter($pTop3ByLane, fn (?float $p): bool => $p !== null);
+        if ($probs === []) {
+            return null;
+        }
+
+        $maxProb = max($probs);
+        if ($maxProb < $threshold) {
+            return null;
+        }
+
+        $lane = array_search($maxProb, $probs, true);
+
+        return ['lane' => $lane, 'p_top3' => $maxProb];
+    }
 }
