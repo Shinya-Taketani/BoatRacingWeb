@@ -75,8 +75,16 @@ V3_FEATURE_COLUMNS = [
     "national_win_rate_std_in_race",
     "a1_count_in_race",
 ]
+V4_FEATURE_COLUMNS = [
+    "stadium_lane_win_rate",
+    "stadium_lane_avg_start_course",
+    "stadium_maeduke_rate",
+    "racer_stadium_lane_win_rate_recent30",
+    "racer_stadium_avg_start_course_recent30",
+]
 COMBINED_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS
 ALL_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS + V3_FEATURE_COLUMNS
+WITH_V4_FEATURE_COLUMNS = ALL_FEATURE_COLUMNS + V4_FEATURE_COLUMNS
 CATEGORICAL_FEATURES = ["stadium_id"]
 TARGET_COLUMN = "is_winner"
 
@@ -116,6 +124,23 @@ _ALL_SELECT_SQL = """
     ORDER BY f1.race_id, f1.lane
 """
 
+_V4_SELECT_SQL = """
+    SELECT f1.race_id, f1.lane, f1.payload AS payload_v1, f2.payload AS payload_v2,
+           f3.payload AS payload_v3, f4.payload AS payload_v4, rr.finish_pos
+    FROM features f1
+    JOIN features f2
+        ON f2.race_id = f1.race_id AND f2.lane = f1.lane AND f2.feature_version = 'v2_recent'
+    JOIN features f3
+        ON f3.race_id = f1.race_id AND f3.lane = f1.lane AND f3.feature_version = 'v3_relative'
+    JOIN features f4
+        ON f4.race_id = f1.race_id AND f4.lane = f1.lane AND f4.feature_version = 'v4_stadium'
+    JOIN races r ON r.id = f1.race_id
+    JOIN race_entries re ON re.race_id = f1.race_id AND re.lane = f1.lane
+    LEFT JOIN race_results rr ON rr.race_entry_id = re.id
+    WHERE f1.feature_version = 'v1_basic' AND r.race_date BETWEEN %s AND %s
+    ORDER BY f1.race_id, f1.lane
+"""
+
 
 def fetch_combined_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
     """v1_basic と v2_recent の payload を (race_id, lane) でマージしたDataFrameを返す。"""
@@ -144,6 +169,24 @@ def fetch_all_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
     records = []
     for race_id, lane, payload_v1, payload_v2, payload_v3, finish_pos in rows:
         record = {**payload_v1, **payload_v2, **payload_v3}
+        record["race_id"] = race_id
+        record["lane"] = lane
+        record["finish_pos"] = finish_pos
+        record["is_winner"] = 1 if finish_pos == 1 else 0
+        records.append(record)
+
+    return pl.DataFrame(records)
+
+
+def fetch_v4_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
+    """v1_basic + v2_recent + v3_relative + v4_stadium の payload をマージする。"""
+    with conn.cursor() as cur:
+        cur.execute(_V4_SELECT_SQL, (start, end))
+        rows = cur.fetchall()
+
+    records = []
+    for race_id, lane, payload_v1, payload_v2, payload_v3, payload_v4, finish_pos in rows:
+        record = {**payload_v1, **payload_v2, **payload_v3, **payload_v4}
         record["race_id"] = race_id
         record["lane"] = lane
         record["finish_pos"] = finish_pos
@@ -444,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
         combined_val_df = fetch_combined_dataset(conn, VAL_START, VAL_END)
         all_train_df = fetch_all_dataset(conn, TRAIN_START, TRAIN_END)
         all_val_df = fetch_all_dataset(conn, VAL_START, VAL_END)
+        v4_train_df = fetch_v4_dataset(conn, TRAIN_START, TRAIN_END)
+        v4_val_df = fetch_v4_dataset(conn, VAL_START, VAL_END)
     finally:
         conn.close()
 
@@ -451,13 +496,13 @@ def main(argv: list[str] | None = None) -> int:
         f"train ({TRAIN_START}..{TRAIN_END}): "
         f"races={v1_train_df.select(pl.col('race_id').n_unique()).item()} "
         f"rows(v1)={v1_train_df.height} rows(v1+v2)={combined_train_df.height} "
-        f"rows(v1+v2+v3)={all_train_df.height}"
+        f"rows(v1+v2+v3)={all_train_df.height} rows(v1+v2+v3+v4)={v4_train_df.height}"
     )
     print(
         f"val   ({VAL_START}..{VAL_END}): "
         f"races={v1_val_df.select(pl.col('race_id').n_unique()).item()} "
         f"rows(v1)={v1_val_df.height} rows(v1+v2)={combined_val_df.height} "
-        f"rows(v1+v2+v3)={all_val_df.height}"
+        f"rows(v1+v2+v3)={all_val_df.height} rows(v1+v2+v3+v4)={v4_val_df.height}"
     )
 
     dummy_hit_rate = dummy_lane1_hit_rate(v1_val_df)
@@ -485,12 +530,37 @@ def main(argv: list[str] | None = None) -> int:
         ALL_FEATURE_COLUMNS,
         args.num_boost_round,
     )
+    run_v4 = _run(
+        "v1_basic + v2_recent + v3_relative + v4_stadium (binary)",
+        v4_train_df,
+        v4_val_df,
+        WITH_V4_FEATURE_COLUMNS,
+        args.num_boost_round,
+    )
 
     print("\n=== 評価指標比較(検証期間) ===")
     _print_metrics(run_v1)
     _print_metrics(run_combined)
     _print_metrics(run_all)
     _print_metrics(run_lambdarank)
+    _print_metrics(run_v4)
+
+    print("\n=== feature importance (v1_basic + v2_recent + v3_relative + v4_stadium) ===")
+    for row in feature_importance(run_v4.booster).iter_rows(named=True):
+        tag = (
+            " [v4]" if row["feature"] in V4_FEATURE_COLUMNS
+            else " [v3]" if row["feature"] in V3_FEATURE_COLUMNS
+            else " [v2]" if row["feature"] in V2_FEATURE_COLUMNS
+            else ""
+        )
+        print(f"  {row['feature']:<32s} gain={row['gain']:>14.1f} split={row['split']}{tag}")
+
+    print("\n=== 欠損率(v4特徴量、検証期間) ===")
+    for row in missing_rate_report(v4_val_df, V4_FEATURE_COLUMNS).iter_rows(named=True):
+        print(
+            f"  {row['feature']:<32s} missing={row['missing_count']} "
+            f"rate={row['missing_rate']:.4f} ({row['missing_rate'] * 100:.2f}%)"
+        )
 
     print("\n=== feature importance (v1_basic + v2_recent + v3_relative, binary) ===")
     for row in feature_importance(run_all.booster).iter_rows(named=True):

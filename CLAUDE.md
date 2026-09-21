@@ -132,7 +132,8 @@
   **約450時間(≒19日)** かかり非現実的と判断。過去分のバックフィルは
   行わず、**本日(2026-09-21)以降のみリアルタイムで記録**する方針とした。
   当面は記録のみで特徴量・学習には使わない。数ヶ月分貯まった時点で
-  `v4_exhibition` として特徴量に追加することを検討する。
+  特徴量に追加することを検討する（`v4`はstadium特徴量が使ったため、
+  追加するなら`v5_exhibition`等の名前になる）。
 
 ### 現在ステータス: 財団への利用許諾確認のため一時停止中（2026-09-21）
 - `https://www.boatrace.jp/owpc/pc/extra/policy.html`（サイトポリシー）
@@ -153,3 +154,33 @@
     コメントアウトを解除すれば再開できる
   - 問い合わせ窓口: `https://www.boatrace.jp/owpc/pc/support/opinion`
     （サイトポリシーページ記載の「お問い合わせフォーム」）
+
+## v4_stadium 特徴量（2026-09-21）
+- 場の特性・選手の場適性を追加。`ml/src/ml/features/stadium.py`。
+  1. 場×枠番の基礎統計（race_dateより厳密に前の全履歴、expanding window。
+     全期間の集計値を使うとリークになるため、PostgreSQLのウィンドウ関数
+     `RANGE BETWEEN UNBOUNDED PRECEDING AND '1 day' PRECEDING`で
+     1パス計算している）:
+     `stadium_lane_win_rate` / `stadium_lane_avg_start_course` /
+     `stadium_maeduke_rate`（場全体・枠番問わずの前付け発生率）
+  2. 選手の場適性（直近30走、v2_recentと同じLATERAL/LIMIT方式）:
+     `racer_stadium_lane_win_rate_recent30` /
+     `racer_stadium_avg_start_course_recent30`
+  3. 気象情報は**実装しなかった**。Kファイルのレースヘッダには天候・
+     風向・風速・波高が実際に含まれている（例:
+     `H1800m  晴　  風  北西　 2m  波　  1cm`）が、Kファイルは結果ファイル
+     であり、この値はレース施行時点(結果確定後)のものであって締切10分前
+     には存在しない。特徴量に使うとリークになるため見送った
+     （締切前に取得できる気象ソースとしてはbeforeinfoページのものがあるが、
+     現在は財団への確認待ちで停止中。上記参照）。
+- 1ヶ月分(2026-08)で計測: 6.3秒（うち準備フェーズ=全履歴のwindow計算が
+  3.7秒でほぼ固定費用、対象期間分の読み取り+書き込みが2.6秒）。
+  全期間(2023-09-01〜2026-09-21、1,026,216行)は59.8秒で完了。
+- **v1+v2+v3 と v1+v2+v3+v4 の比較（検証期間、binary、同一パラメータ）**:
+  的中率 56.20%→56.19%(-0.01pt)、log loss 1.1974→1.1980(+0.0005)、
+  Brier 0.5834→0.5836(+0.0002)。**改善なし（誤差の範囲でわずかに悪化）**。
+  feature importanceでは`stadium_lane_win_rate`が5位(gain=38,411)に入り
+  モデル自体は使っているが、既存のv2`lane_win_rate_recent50`（選手個人の
+  枠番別1着率）と情報が重複しており、held-out性能の向上には寄与しな
+  かったと考えられる。v4は現状predictions生成には使わず、featuresテーブル
+  への記録のみに留める。
