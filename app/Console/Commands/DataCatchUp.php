@@ -12,8 +12,13 @@ use Illuminate\Support\Facades\Process;
 
 /**
  * 起動時（電源offで運用しているため、起動のたびにデータが欠けている
- * 可能性がある）に、直近N日分の races/race_results/payouts/predictions の
- * 欠損を検出し、順に埋める。
+ * 可能性がある）に、直近N日分の races/race_results/payouts/predictions/
+ * top3_predictions の欠損を検出し、順に埋める。
+ *
+ * predictions(1着予測モデル)とtop3_predictions(3着以内予測モデル)は
+ * 2026-10-04の2モデル構成化以降、別々に検知する（片方だけ欠けている状態を
+ * 「揃っている」と誤判定しないため。CLAUDE.md「本番モデルを2本立て構成に
+ * 変更」参照）。
  *
  * オッズ(odds_snapshots)は締切後には取得し直せないため埋めようとはせず、
  * data_coverage.odds_race_count に「その日オッズを取得できたレース数」を
@@ -26,15 +31,26 @@ class DataCatchUp extends Command
 {
     protected $signature = 'data:catch-up {--days=14 : 直近何日分をチェックするか}';
 
-    protected $description = '直近N日の races/race_results/payouts/predictions の欠損を検出し、順に投入する（オッズは記録のみ）';
+    protected $description = '直近N日の races/race_results/payouts/predictions/top3_predictions の欠損を検出し、順に投入する（オッズは記録のみ）';
 
     public function handle(): int
     {
         $modelVersion = config('ml.prediction_model_version');
+        $top3ModelVersion = config('ml.prediction_top3_model_version');
         $stage = config('ml.prediction_stage');
+        // stage2は記録専用(odds_race_countと同じ扱い)なので、未設定でも
+        // data:catch-up自体は失敗させない（nullのままrefreshCoverage()に渡すと
+        // 常に0件として記録される）。
+        $stage2ModelVersion = config('ml.prediction_stage2_model_version');
 
         if (! $modelVersion) {
             $this->error('PREDICTION_MODEL_VERSION が設定されていません（predictions欠損の補完に必要です）。');
+
+            return self::FAILURE;
+        }
+
+        if (! $top3ModelVersion) {
+            $this->error('PREDICTION_TOP3_MODEL_VERSION が設定されていません（predictions欠損の補完に必要です）。');
 
             return self::FAILURE;
         }
@@ -46,7 +62,9 @@ class DataCatchUp extends Command
         $this->info("data:catch-up: {$from} 〜 {$to}（{$days}日分）の欠損を検出します。");
         Log::info("data:catch-up start: {$from}..{$to} (days={$days})");
 
-        DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($from), Carbon::parse($to));
+        DataCoverage::refreshCoverage(
+            $modelVersion, $top3ModelVersion, $stage, Carbon::parse($from), Carbon::parse($to), $stage2ModelVersion
+        );
 
         $dates = collect();
         for ($cursor = Carbon::parse($from); $cursor->lte(Carbon::parse($to)); $cursor->addDay()) {
@@ -54,7 +72,7 @@ class DataCatchUp extends Command
         }
 
         foreach ($dates as $date) {
-            $this->fillDate($date, $modelVersion, $stage);
+            $this->fillDate($date, $modelVersion, $top3ModelVersion, $stage);
         }
 
         // race_resultsを取り込んだ直後に判定まで済ませる。23:30の日次バッチを
@@ -65,14 +83,16 @@ class DataCatchUp extends Command
         Log::info("data:catch-up: predictions:judge exit={$judgeExit}");
 
         // 全期間まとめて最終状態に更新してからレポートする
-        DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($from), Carbon::parse($to));
+        DataCoverage::refreshCoverage(
+            $modelVersion, $top3ModelVersion, $stage, Carbon::parse($from), Carbon::parse($to), $stage2ModelVersion
+        );
         $this->report($from, $to);
         $this->reportTodayYesterday($to);
 
         return self::SUCCESS;
     }
 
-    private function fillDate(string $date, string $modelVersion, int $stage): void
+    private function fillDate(string $date, string $modelVersion, string $top3ModelVersion, int $stage): void
     {
         $coverage = DataCoverage::find($date);
 
@@ -82,7 +102,7 @@ class DataCatchUp extends Command
             Log::info("data:catch-up: races:fetch-today {$date} exit={$exit}");
 
             // 直後にhas_racesだけ更新し、以降の判定に使えるようにする
-            DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($date), Carbon::parse($date));
+            DataCoverage::refreshCoverage($modelVersion, $top3ModelVersion, $stage, Carbon::parse($date), Carbon::parse($date));
             $coverage = DataCoverage::find($date);
         }
 
@@ -109,12 +129,22 @@ class DataCatchUp extends Command
                 Log::info("data:catch-up: load-results {$date} ok");
             }
 
-            DataCoverage::refreshCoverage($modelVersion, $stage, Carbon::parse($date), Carbon::parse($date));
+            DataCoverage::refreshCoverage($modelVersion, $top3ModelVersion, $stage, Carbon::parse($date), Carbon::parse($date));
             $coverage = DataCoverage::find($date);
         }
 
-        if ($coverage->has_races && ! $coverage->has_predictions) {
-            $this->line("{$date}: predictions 欠損 -> predictions:generate-today を実行");
+        // predictions(1着予測モデル)/top3_predictions(3着以内予測モデル)は
+        // どちらか一方でも欠けていれば再実行する。predictions:generate-today
+        // は(race_id, model_version, stage)単位で既存分をスキップするため、
+        // 片方だけ欠けている状態からの再実行でも無駄なく埋まる
+        // （2026-10-04、2モデル構成化。CLAUDE.md「本番モデルを2本立て構成に
+        // 変更」参照）。
+        if ($coverage->has_races && (! $coverage->has_predictions || ! $coverage->has_top3_predictions)) {
+            $missing = collect([
+                'predictions' => ! $coverage->has_predictions,
+                'top3_predictions' => ! $coverage->has_top3_predictions,
+            ])->filter()->keys()->implode(',');
+            $this->line("{$date}: {$missing} 欠損 -> predictions:generate-today を実行");
             $exit = $this->call('predictions:generate-today', ['date' => $date]);
             Log::info("data:catch-up: predictions:generate-today {$date} exit={$exit}");
         }
@@ -125,20 +155,22 @@ class DataCatchUp extends Command
         $rows = DataCoverage::whereBetween('race_date', [$from, $to])->orderBy('race_date')->get();
 
         $stillMissing = $rows->filter(
-            fn (DataCoverage $row) => ! $row->has_races || ! $row->has_results || ! $row->has_payouts || ! $row->has_predictions
+            fn (DataCoverage $row) => ! $row->has_races || ! $row->has_results || ! $row->has_payouts
+                || ! $row->has_predictions || ! $row->has_top3_predictions
         );
 
         $this->info('--- data:catch-up 結果 ---');
         if ($stillMissing->isEmpty()) {
-            $this->info('races/race_results/payouts/predictions: 欠損なし');
+            $this->info('races/race_results/payouts/predictions/top3_predictions: 欠損なし');
         } else {
-            $this->warn("races/race_results/payouts/predictions: まだ埋まっていない日付が{$stillMissing->count()}件あります");
+            $this->warn("races/race_results/payouts/predictions/top3_predictions: まだ埋まっていない日付が{$stillMissing->count()}件あります");
             foreach ($stillMissing as $row) {
                 $missing = collect([
                     'races' => ! $row->has_races,
                     'results' => ! $row->has_results,
                     'payouts' => ! $row->has_payouts,
                     'predictions' => ! $row->has_predictions,
+                    'top3_predictions' => ! $row->has_top3_predictions,
                 ])->filter()->keys()->implode(',');
                 $this->line("  {$row->race_date->toDateString()}: {$missing}");
             }
@@ -166,8 +198,29 @@ class DataCatchUp extends Command
             }
         }
 
-        Log::info('data:catch-up done: '.$stillMissing->count().' date(s) still missing races/results/payouts/predictions, '
-            .$oddsGaps->count().' date(s) with incomplete odds');
+        // stage2は補完しない（predictions:generate-stage2の毎分ジョブが
+        // 別途担当する）。races数に対する生成数の状況を記録として出すのみ。
+        // boolean化していないため、criticalGapsFor()には含まれず
+        // data:catch-up:statusの判定には影響しない（CLAUDE.md「stage2構成」参照）。
+        $stage2Gaps = $rows->filter(function (DataCoverage $row) use ($raceCountByDate) {
+            $total = $raceCountByDate[$row->race_date->toDateString()] ?? 0;
+
+            return $total > 0 && $row->stage2_prediction_race_count < $total;
+        });
+
+        if ($stage2Gaps->isEmpty()) {
+            $this->info('stage2_predictions: 欠損なし');
+        } else {
+            $this->warn("stage2_predictions: 未生成日が{$stage2Gaps->count()}件あります（記録のみ、data:catch-upでは補完しません）");
+            foreach ($stage2Gaps as $row) {
+                $total = $raceCountByDate[$row->race_date->toDateString()] ?? 0;
+                $this->line("  {$row->race_date->toDateString()}: {$row->stage2_prediction_race_count}/{$total} レース");
+            }
+        }
+
+        Log::info('data:catch-up done: '.$stillMissing->count().' date(s) still missing races/results/payouts/predictions/top3_predictions, '
+            .$oddsGaps->count().' date(s) with incomplete odds, '
+            .$stage2Gaps->count().' date(s) with incomplete stage2_predictions');
     }
 
     /**
@@ -202,19 +255,20 @@ class DataCatchUp extends Command
         }
 
         if ($missing === []) {
-            $this->info("  [OK] {$label}({$date}): races/results/payouts/predictions すべて揃っています");
+            $this->info("  [OK] {$label}({$date}): races/results/payouts/predictions/top3_predictions すべて揃っています");
 
             return;
         }
 
         // 前日分はもう全部揃っているはずなので、何か欠けていれば厳格に警告する。
         // 当日分は結果・払戻がレース終了までに確定していないのが正常なので、
-        // races/predictions（朝06:00-06:15のバッチで揃うはず）だけを見る。
+        // races/predictions/top3_predictions（朝06:00-06:15のバッチで揃う
+        // はず）だけを見る。
         $critical = DataCoverage::criticalGapsFor($date, $strict) ?? [];
 
         if ($critical === []) {
             $this->info(
-                "  [--] {$label}({$date}): races/predictionsは揃っています "
+                "  [--] {$label}({$date}): races/predictions/top3_predictionsは揃っています "
                 .'(results/payoutsはレース終了後に確定するため、未取得でも当日中は正常)'
             );
 

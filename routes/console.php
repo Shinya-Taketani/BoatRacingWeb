@@ -34,13 +34,14 @@ Schedule::command('odds:schedule-today')
 // 直前情報(展示タイム等)の自動取得(beforeinfo:schedule-today)は
 // 2026-09-21、boatrace.jpのサイトポリシー「禁止事項について」5.
 // （不正アクセス、大量の情報送受信及び大量のアクセスなど、本サイトの
-// 運営に支障を与える行為）に抵触しないか財団に確認するまで停止する。
-// コマンド自体・スクレイパー・テーブルは残してあるので、許諾が取れ次第
-// このスケジュール登録を復活させればよい。CLAUDE.md参照。
-// Schedule::command('beforeinfo:schedule-today')
-//     ->dailyAt('06:06')
-//     ->timezone(config('app.race_timezone'))
-//     ->appendOutputTo($scheduleLog);
+// 運営に支障を与える行為）に抵触しないか財団に確認するため一時停止して
+// いたが、2026-10-08、財団への確認は未解決のままユーザー判断でリスクを
+// 受容し再開した（stage2(v5_exhibitionを含む直前再予測)の前提として必要
+// なため。backfill実行時と同じ判断。CLAUDE.md「stage2構成」参照）。
+Schedule::command('beforeinfo:schedule-today')
+    ->dailyAt('06:05')
+    ->timezone(config('app.race_timezone'))
+    ->appendOutputTo($scheduleLog);
 
 // レース一覧の取り込み(06:00)の後、当日分の特徴量生成→推論を行い、
 // predictions/prediction_entries に書き込む。買い目生成(tickets:generate-today)
@@ -55,6 +56,22 @@ Schedule::command('predictions:generate-today')
 Schedule::command('tickets:generate-today')
     ->dailyAt('06:15')
     ->timezone(config('app.race_timezone'))
+    ->appendOutputTo($scheduleLog);
+
+// stage2(直前再予測、v5_exhibitionを含む)。beforeinfo:schedule-todayが
+// 予約したCaptureBeforeInfoJobが各レース締切T-12分に順次完了していくのに
+// 合わせて、毎分呼び出す。対象レースの絞り込み(ライブ取得済み・
+// cutoff_at前・stage2未生成)はPredictionsGenerateStage2::findEligibleRaceIds()
+// の事前チェック1クエリで行い、0件ならuv runを一切呼ばずに即終了する
+// （2026-10-08追加。CLAUDE.md「stage2構成」参照）。
+// withoutOverlapping(10)：1回の処理が60秒を超えて次回の起動と重なると、
+// 同じレースを並行処理してpredictions存在チェックが競合する恐れがある
+// ため多重起動を禁止する。expiresAt=10分はプロセス異常終了時にロックが
+// 残り続けないための安全弁（通常の処理は数秒で終わる想定）。
+Schedule::command('predictions:generate-stage2')
+    ->everyMinute()
+    ->timezone(config('app.race_timezone'))
+    ->withoutOverlapping(10)
     ->appendOutputTo($scheduleLog);
 
 // その日の全レース終了後、結果が確定した予測をまとめて判定する。

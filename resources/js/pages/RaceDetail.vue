@@ -3,6 +3,7 @@ import { onMounted, ref, watch } from 'vue';
 import { fetchRace } from '../api';
 import { formatPercent, formatTime } from '../format';
 import ConfidenceBadge from '../components/ConfidenceBadge.vue';
+import BeforeInfoBadge from '../components/BeforeInfoBadge.vue';
 
 const props = defineProps({
     id: { type: [String, Number], required: true },
@@ -51,9 +52,16 @@ function predictionFor(lane) {
                 >
                     1号艇 危険
                 </span>
+                <BeforeInfoBadge v-if="race.uses_before_info" />
             </div>
             <p v-if="race.event_name || race.title" class="mb-4 text-sm text-slate-500">
                 {{ race.event_name }} {{ race.title }}
+            </p>
+            <p
+                v-if="race.uses_before_info"
+                class="mb-4 rounded-md border border-teal-200 bg-teal-50 px-3 py-2 text-sm text-teal-800"
+            >
+                この予測は展示タイム・体重・気象等の直前情報を反映して更新されています。朝時点の予測から内容が変わっている場合があります。
             </p>
 
             <h2 class="mb-2 text-sm font-semibold text-slate-500">出走表</h2>

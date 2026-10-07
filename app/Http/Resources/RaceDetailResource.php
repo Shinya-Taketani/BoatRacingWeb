@@ -13,11 +13,20 @@ class RaceDetailResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
-        $prediction = $this->prediction;
+        // 「レースごとにstage2があればそれ、無ければstage1」をここで統一する
+        // （2026-10-08、stage2構成。CLAUDE.md「stage2構成」参照）。
+        $prediction = $this->effectivePrediction();
         $pFirstByLane = $prediction
             ? $prediction->entries->pluck('p_first', 'lane')->all()
             : [];
         $normalizedEntropy = ConfidenceGrader::normalizedEntropy($pFirstByLane);
+
+        // p_top3は「3着以内モデル」(top3Prediction)から取得する
+        // （2026-10-04、2モデル構成に変更。CLAUDE.md「p_top3の直接学習モデル」参照）。
+        $top3Prediction = $this->effectiveTop3Prediction();
+        $pTop3ByLane = $top3Prediction
+            ? $top3Prediction->entries->pluck('p_top3', 'lane')->all()
+            : [];
 
         return [
             'id' => $this->id,
@@ -27,6 +36,7 @@ class RaceDetailResource extends JsonResource
             'deadline_at' => $this->deadline_at?->toIso8601String(),
             'title' => $this->title,
             'event_name' => $this->event_name,
+            'uses_before_info' => $this->usesBeforeInfo(),
             'entries' => $this->raceEntries->map(fn ($entry) => [
                 'lane' => $entry->lane,
                 'racer_name' => $entry->racer->name,
@@ -55,7 +65,7 @@ class RaceDetailResource extends JsonResource
                     'lane' => $e->lane,
                     'p_first' => $e->p_first,
                     'p_top2' => $e->p_top2,
-                    'p_top3' => $e->p_top3,
+                    'p_top3' => $pTop3ByLane[$e->lane] ?? null,
                 ])->values(),
                 'tickets' => $prediction->tickets->map(fn ($t) => [
                     'bet_type' => $t->bet_type,

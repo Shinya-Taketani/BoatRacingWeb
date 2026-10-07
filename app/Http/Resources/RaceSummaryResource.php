@@ -20,12 +20,19 @@ class RaceSummaryResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
-        $prediction = $this->prediction;
+        // 「レースごとにstage2があればそれ、無ければstage1」をここで統一する
+        // （2026-10-08、stage2構成。CLAUDE.md「stage2構成」参照）。
+        $prediction = $this->effectivePrediction();
         $pFirstByLane = $prediction
             ? $prediction->entries->pluck('p_first', 'lane')->all()
             : [];
-        $pTop3ByLane = $prediction
-            ? $prediction->entries->pluck('p_top3', 'lane')->all()
+
+        // p_top3は「3着以内モデル」(top3Prediction、prediction本体とは別の
+        // predictionsレコード)から取得する（2026-10-04、2モデル構成に変更。
+        // CLAUDE.md「p_top3の直接学習モデル」参照）。
+        $top3Prediction = $this->effectiveTop3Prediction();
+        $pTop3ByLane = $top3Prediction
+            ? $top3Prediction->entries->pluck('p_top3', 'lane')->all()
             : [];
 
         $normalizedEntropy = ConfidenceGrader::normalizedEntropy($pFirstByLane);
@@ -58,6 +65,7 @@ class RaceSummaryResource extends JsonResource
             'predicted_hit' => ($topLane !== null && $winnerEntry !== null)
                 ? $topLane === $winnerEntry->lane
                 : null,
+            'uses_before_info' => $this->usesBeforeInfo(),
         ];
     }
 }

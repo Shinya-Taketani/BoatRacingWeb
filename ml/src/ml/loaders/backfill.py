@@ -36,7 +36,7 @@ from ml.loaders.racer_snapshots import upsert_daily_snapshots
 from ml.loaders.races import LoaderError as RaceLoaderError
 from ml.loaders.races import upsert_races_and_entries
 from ml.loaders.results import LoaderError as ResultLoaderError
-from ml.loaders.results import upsert_race_results
+from ml.loaders.results import mark_cancelled_races, upsert_race_results
 from ml.parsers.program import ProgramParseError, parse_program_path
 from ml.parsers.result import ResultParseError, parse_result_path
 
@@ -100,11 +100,13 @@ def _load_one_day(conn, d: date, data_dir: Path, *, defer_compaction: bool = Fal
 
     parsed_result = parse_result_path(k_path)
     result_load = upsert_race_results(conn, parsed_result)
+    cancelled_load = mark_cancelled_races(conn, parsed_result.cancelled)
 
     return {
         "races": race_result.races_upserted,
         "entries": race_result.entries_upserted,
         "results": result_load.results_upserted,
+        "cancelled": cancelled_load.races_marked_cancelled,
         "snapshot_warnings": len(snapshot_result.warnings),
         "compaction_warnings": compaction_warnings,
         "compaction_deleted": compaction_deleted,
@@ -148,10 +150,11 @@ def run_backfill(
                 if stats["compaction_deleted"]
                 else ""
             )
+            cancelled_note = f" cancelled={stats['cancelled']}" if stats["cancelled"] else ""
             print(
                 f"[{i}/{total}] {key}: OK "
                 f"races={stats['races']} entries={stats['entries']} results={stats['results']}"
-                f"{deleted_note}"
+                f"{cancelled_note}{deleted_note}"
             )
         except _KNOWN_ERRORS as exc:
             state[key] = {"status": "failed", "error": str(exc)}

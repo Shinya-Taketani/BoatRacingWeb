@@ -82,10 +82,34 @@ V4_FEATURE_COLUMNS = [
     "racer_stadium_lane_win_rate_recent30",
     "racer_stadium_avg_start_course_recent30",
 ]
+V5_FEATURE_COLUMNS = [
+    "exhibit_time",
+    "exhibit_time_rank_in_race",
+    "exhibit_time_dev_from_race_avg",
+    "st_exhibit",
+    "st_exhibit_rank_in_race",
+    "course_predicted",
+    "tilt",
+    "exhibit_weight",
+    "exhibit_adjusted_weight",
+    "propeller_changed_flag",
+    "parts_exchanged_flag",
+    "weather_temperature",
+    "weather_wind_speed",
+    "weather_wind_direction_code",
+    "weather_wave_height",
+    "weather_water_temperature",
+    "weather_condition_code",
+]
 COMBINED_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS
 ALL_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS + V3_FEATURE_COLUMNS
 WITH_V4_FEATURE_COLUMNS = ALL_FEATURE_COLUMNS + V4_FEATURE_COLUMNS
-CATEGORICAL_FEATURES = ["stadium_id"]
+WITH_V5_FEATURE_COLUMNS = ALL_FEATURE_COLUMNS + V5_FEATURE_COLUMNS
+# weather_wind_direction_code/weather_condition_codeは名義尺度(順序に意味の
+# 保証がない)なのでcategorical_featureとして扱う。v5特徴量を含まない既存の
+# 実験ではfeature_columnsに存在しないため、この追加は無害(train_model側で
+# `if c in feature_columns`によりガードされる)。
+CATEGORICAL_FEATURES = ["stadium_id", "weather_wind_direction_code", "weather_condition_code"]
 TARGET_COLUMN = "is_winner"
 
 DEFAULT_PARAMS = {
@@ -111,7 +135,7 @@ _COMBINED_SELECT_SQL = """
 
 _ALL_SELECT_SQL = """
     SELECT f1.race_id, f1.lane, f1.payload AS payload_v1, f2.payload AS payload_v2,
-           f3.payload AS payload_v3, rr.finish_pos
+           f3.payload AS payload_v3, rr.finish_pos, (rr.race_entry_id IS NOT NULL) AS has_result_row
     FROM features f1
     JOIN features f2
         ON f2.race_id = f1.race_id AND f2.lane = f1.lane AND f2.feature_version = 'v2_recent'
@@ -142,6 +166,44 @@ _V4_SELECT_SQL = """
 """
 
 
+_V5_SELECT_SQL = """
+    SELECT f1.race_id, f1.lane, f1.payload AS payload_v1, f2.payload AS payload_v2,
+           f3.payload AS payload_v3, f5.payload AS payload_v5, rr.finish_pos,
+           (rr.race_entry_id IS NOT NULL) AS has_result_row
+    FROM features f1
+    JOIN features f2
+        ON f2.race_id = f1.race_id AND f2.lane = f1.lane AND f2.feature_version = 'v2_recent'
+    JOIN features f3
+        ON f3.race_id = f1.race_id AND f3.lane = f1.lane AND f3.feature_version = 'v3_relative'
+    JOIN features f5
+        ON f5.race_id = f1.race_id AND f5.lane = f1.lane AND f5.feature_version = 'v5_exhibition'
+    JOIN races r ON r.id = f1.race_id
+    JOIN race_entries re ON re.race_id = f1.race_id AND re.lane = f1.lane
+    LEFT JOIN race_results rr ON rr.race_entry_id = re.id
+    WHERE f1.feature_version = 'v1_basic' AND r.race_date BETWEEN %s AND %s
+    ORDER BY f1.race_id, f1.lane
+"""
+
+
+def fetch_v5_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
+    """v1_basic + v2_recent + v3_relative + v5_exhibition の payload をマージする。"""
+    with conn.cursor() as cur:
+        cur.execute(_V5_SELECT_SQL, (start, end))
+        rows = cur.fetchall()
+
+    records = []
+    for race_id, lane, payload_v1, payload_v2, payload_v3, payload_v5, finish_pos, has_result_row in rows:
+        record = {**payload_v1, **payload_v2, **payload_v3, **payload_v5}
+        record["race_id"] = race_id
+        record["lane"] = lane
+        record["finish_pos"] = finish_pos
+        record["is_winner"] = 1 if finish_pos == 1 else 0
+        record["has_result_row"] = has_result_row
+        records.append(record)
+
+    return pl.DataFrame(records)
+
+
 def fetch_combined_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
     """v1_basic と v2_recent の payload を (race_id, lane) でマージしたDataFrameを返す。"""
     with conn.cursor() as cur:
@@ -167,12 +229,13 @@ def fetch_all_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
         rows = cur.fetchall()
 
     records = []
-    for race_id, lane, payload_v1, payload_v2, payload_v3, finish_pos in rows:
+    for race_id, lane, payload_v1, payload_v2, payload_v3, finish_pos, has_result_row in rows:
         record = {**payload_v1, **payload_v2, **payload_v3}
         record["race_id"] = race_id
         record["lane"] = lane
         record["finish_pos"] = finish_pos
         record["is_winner"] = 1 if finish_pos == 1 else 0
+        record["has_result_row"] = has_result_row
         records.append(record)
 
     return pl.DataFrame(records)

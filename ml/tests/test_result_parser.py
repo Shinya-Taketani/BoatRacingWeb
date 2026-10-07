@@ -189,3 +189,61 @@ def test_program_and_result_agree_on_registration_number_per_lane():
     }
 
     assert b_reg == k_reg
+
+
+# --- 中止レース ------------------------------------------------------------
+
+# 2026-09-21: 戸田(02)・江戸川(03)が全12R中止、津(09)が5〜12R中止、
+# 三国(10)が10〜12R中止（荒天。backfill時にキャッシュ済みの実ファイル）。
+CANCEL_FULL_DAY_PATH = DATA_DIR / "K260921.TXT"
+# 2026-09-22: 津(09)のみ全12R中止。
+CANCEL_PARTIAL_STADIUM_PATH = DATA_DIR / "K260922.TXT"
+
+
+@pytest.mark.skipif(
+    not CANCEL_FULL_DAY_PATH.exists(),
+    reason=f"real fixture not found: {CANCEL_FULL_DAY_PATH} (2026-09-21分backfill時にキャッシュ)",
+)
+def test_cancelled_races_are_recorded_for_fully_and_partially_cancelled_stadiums():
+    result = parse_result_path(CANCEL_FULL_DAY_PATH)
+    cancelled = {(c.stadium_code, c.race_no) for c in result.cancelled}
+
+    assert len(result.cancelled) == 35  # 12 + 12 + 8 + 3
+    assert cancelled == (
+        {(2, n) for n in range(1, 13)}
+        | {(3, n) for n in range(1, 13)}
+        | {(9, n) for n in range(5, 13)}
+        | {(10, n) for n in range(10, 13)}
+    )
+    # 全ての中止レースの race_date は正しく場ヘッダの開催日になっている
+    assert {c.race_date for c in result.cancelled} == {result.results[0].race_date}
+
+
+@pytest.mark.skipif(
+    not CANCEL_FULL_DAY_PATH.exists(),
+    reason=f"real fixture not found: {CANCEL_FULL_DAY_PATH}",
+)
+def test_cancelled_race_has_no_result_or_payout_rows():
+    result = parse_result_path(CANCEL_FULL_DAY_PATH)
+
+    cancelled_keys = {(c.stadium_code, c.race_no) for c in result.cancelled}
+    result_keys = {(r.stadium_code, r.race_no) for r in result.results}
+    payout_keys = {(p.stadium_code, p.race_no) for p in result.payouts}
+
+    assert cancelled_keys.isdisjoint(result_keys)
+    assert cancelled_keys.isdisjoint(payout_keys)
+
+
+@pytest.mark.skipif(
+    not CANCEL_PARTIAL_STADIUM_PATH.exists(),
+    reason=f"real fixture not found: {CANCEL_PARTIAL_STADIUM_PATH} (2026-09-22分backfill時にキャッシュ)",
+)
+def test_cancelled_races_for_a_single_fully_cancelled_stadium():
+    result = parse_result_path(CANCEL_PARTIAL_STADIUM_PATH)
+    cancelled = {(c.stadium_code, c.race_no) for c in result.cancelled}
+
+    assert cancelled == {(9, n) for n in range(1, 13)}
+
+
+def test_no_cancelled_races_on_a_normal_day(parsed):
+    assert parsed.cancelled == []

@@ -14,6 +14,25 @@ use Illuminate\Support\Facades\DB;
  * （ml/src/ml/models/tickets.py の overall_recovery() と同じ定義）。
  * CLAUDE.md「プロダクト方針: 的中率と回収率は必ず併記する」に従い、
  * 常に両方を返す。
+ *
+ * 2026-10-08、stage2(v5_exhibitionを含む直前再予測)対応により、
+ * 「レースごとにstage2の予測があればそれ、無ければstage1」を全SQLで
+ * 統一した（CLAUDE.md「stage2構成」参照）。実装は「stage1/stage2の
+ * model_versionのどちらかに一致し、stage(1,2)が揃うpredictions行から
+ * DISTINCT ON (race_id) ... ORDER BY race_id, stage DESC でレースごとに
+ * 1行だけ選ぶ」CTE(active_winner/active_top3)を経由する方式。
+ *
+ * 重要: judge(predictions:judge)はstage1/stage2の両方を独立に判定するため、
+ * stage2が存在するレースはprediction_judgmentsに2行（stage1分・stage2分）
+ * 入っている。上記のactive_winner CTEで必ずレースごとに1つのprediction_id
+ * へ絞ってからjudgments/ticketsをJOINすることで、二重計上を防いでいる
+ * （model_version IN (...) で素朴にWHERE句だけ絞ると、同一レースの
+ * stage1行とstage2行が両方ヒットして二重計上になるため、必ずこのCTEを
+ * 経由すること）。
+ *
+ * 過去日(stage2が一度も生成されていない日)は active_winner/active_top3が
+ * 常にstage1の行だけを選ぶため、集計値は2026-10-08以前の実装と完全に
+ * 一致する（回帰確認済み）。
  */
 class PerformanceController extends Controller
 {
@@ -21,36 +40,53 @@ class PerformanceController extends Controller
 
     public function index(): JsonResponse
     {
-        $modelVersion = config('ml.prediction_model_version');
-        $stage = config('ml.prediction_stage');
+        $stage1Version = config('ml.prediction_model_version');
+        $stage2Version = config('ml.prediction_stage2_model_version');
 
         return response()->json([
-            'model_version' => $modelVersion,
-            'overall' => $this->summaryRow($modelVersion, $stage),
-            'daily' => $this->dailyRows($modelVersion, $stage),
-            'monthly' => $this->monthlyRows($modelVersion, $stage),
+            'model_version' => $stage1Version,
+            'overall' => $this->summaryRow($stage1Version, $stage2Version),
+            'daily' => $this->dailyRows($stage1Version, $stage2Version),
+            'monthly' => $this->monthlyRows($stage1Version, $stage2Version),
         ]);
     }
 
-    private function summaryRow(?string $modelVersion, int $stage): array
+    /**
+     * レースごとに「stage2があればそれ、無ければstage1」の予測1件だけを選ぶCTE。
+     * $modelVersion1/$modelVersion2 は同じ種類(winner同士、またはtop3同士)の
+     * stage1/stage2 model_versionを渡すこと。$modelVersion2がnull(stage2未設定)
+     * でも安全（model_version = NULL は何にも一致しないため、stage1のみの
+     * 挙動にそのままフォールバックする）。
+     */
+    private function activePredictionCte(): string
     {
+        return 'SELECT DISTINCT ON (race_id) id, race_id
+                FROM predictions
+                WHERE model_version IN (?, ?) AND stage IN (1, 2)
+                ORDER BY race_id, stage DESC';
+    }
+
+    private function summaryRow(?string $stage1Version, ?string $stage2Version): array
+    {
+        $activeWinner = $this->activePredictionCte();
+
         $hit = DB::selectOne(
-            'SELECT count(*) AS races, count(*) FILTER (WHERE pj.hit) AS hits
-             FROM prediction_judgments pj
-             JOIN predictions p ON p.id = pj.prediction_id
-             WHERE p.model_version = ? AND p.stage = ?',
-            [$modelVersion, $stage]
+            "WITH active_winner AS ({$activeWinner})
+             SELECT count(*) AS races, count(*) FILTER (WHERE pj.hit) AS hits
+             FROM active_winner a
+             JOIN prediction_judgments pj ON pj.prediction_id = a.id",
+            [$stage1Version, $stage2Version]
         );
 
         $recovery = DB::selectOne(
-            'SELECT count(DISTINCT t.prediction_id) AS ticket_races,
+            "WITH active_winner AS ({$activeWinner})
+             SELECT count(DISTINCT t.prediction_id) AS ticket_races,
                     count(t.id) * 100 AS stake, coalesce(sum(po.payout), 0) AS payout
-             FROM prediction_tickets t
-             JOIN predictions p ON p.id = t.prediction_id
+             FROM active_winner a
+             JOIN prediction_tickets t ON t.prediction_id = a.id AND t.bet_type = ?
              LEFT JOIN payouts po
-                 ON po.race_id = p.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
-             WHERE p.model_version = ? AND p.stage = ? AND t.bet_type = ?',
-            [$modelVersion, $stage, self::BET_TYPE]
+                 ON po.race_id = a.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination",
+            [$stage1Version, $stage2Version, self::BET_TYPE]
         );
 
         return $this->formatRow($hit->races, $hit->hits, $recovery->ticket_races, $recovery->stake, $recovery->payout);
@@ -62,10 +98,11 @@ class PerformanceController extends Controller
      * ため、races起点で日付を確定させ、predictions/judgments/ticketsは
      * LEFT JOINで無ければ0件として出す。
      */
-    private function dailyRows(?string $modelVersion, int $stage): array
+    private function dailyRows(?string $stage1Version, ?string $stage2Version): array
     {
         $end = RaceDate::today();
         $start = Carbon::parse($end)->subDays(29)->toDateString();
+        $activeWinner = $this->activePredictionCte();
 
         $rows = DB::select(
             "WITH race_days AS (
@@ -73,14 +110,15 @@ class PerformanceController extends Controller
                  WHERE race_date BETWEEN ? AND ?
                  GROUP BY race_date
              ),
+             active_winner AS ({$activeWinner}),
              judgment_agg AS (
                  SELECT r.race_date,
                         count(DISTINCT pj.prediction_id) AS races,
                         count(DISTINCT pj.prediction_id) FILTER (WHERE pj.hit) AS hits
-                 FROM predictions p
-                 JOIN races r ON r.id = p.race_id
-                 JOIN prediction_judgments pj ON pj.prediction_id = p.id
-                 WHERE p.model_version = ? AND p.stage = ? AND r.race_date BETWEEN ? AND ?
+                 FROM active_winner a
+                 JOIN races r ON r.id = a.race_id
+                 JOIN prediction_judgments pj ON pj.prediction_id = a.id
+                 WHERE r.race_date BETWEEN ? AND ?
                  GROUP BY r.race_date
              ),
              ticket_agg AS (
@@ -88,12 +126,12 @@ class PerformanceController extends Controller
                         count(DISTINCT t.prediction_id) AS ticket_races,
                         count(t.id) * 100 AS stake,
                         coalesce(sum(po.payout), 0) AS payout
-                 FROM predictions p
-                 JOIN races r ON r.id = p.race_id
-                 JOIN prediction_tickets t ON t.prediction_id = p.id AND t.bet_type = ?
+                 FROM active_winner a
+                 JOIN races r ON r.id = a.race_id
+                 JOIN prediction_tickets t ON t.prediction_id = a.id AND t.bet_type = ?
                  LEFT JOIN payouts po
-                     ON po.race_id = p.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
-                 WHERE p.model_version = ? AND p.stage = ? AND r.race_date BETWEEN ? AND ?
+                     ON po.race_id = a.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
+                 WHERE r.race_date BETWEEN ? AND ?
                  GROUP BY r.race_date
              )
              SELECT to_char(rd.race_date, 'YYYY-MM-DD') AS date,
@@ -108,8 +146,10 @@ class PerformanceController extends Controller
              ORDER BY rd.race_date DESC",
             [
                 $start, $end,
-                $modelVersion, $stage, $start, $end,
-                self::BET_TYPE, $modelVersion, $stage, $start, $end,
+                $stage1Version, $stage2Version,
+                $start, $end,
+                self::BET_TYPE,
+                $start, $end,
             ]
         );
 
@@ -122,33 +162,34 @@ class PerformanceController extends Controller
         );
     }
 
-    private function monthlyRows(?string $modelVersion, int $stage): array
+    private function monthlyRows(?string $stage1Version, ?string $stage2Version): array
     {
+        $activeWinner = $this->activePredictionCte();
+
         $rows = DB::select(
-            "SELECT to_char(r.race_date, 'YYYY-MM') AS month,
+            "WITH active_winner AS ({$activeWinner})
+             SELECT to_char(r.race_date, 'YYYY-MM') AS month,
                     count(DISTINCT pj.prediction_id) AS races,
                     count(DISTINCT pj.prediction_id) FILTER (WHERE pj.hit) AS hits,
                     count(stake_agg.prediction_id) AS ticket_races,
                     coalesce(sum(stake_agg.stake), 0) AS stake,
                     coalesce(sum(stake_agg.payout), 0) AS payout
-             FROM predictions p
-             JOIN races r ON r.id = p.race_id
-             LEFT JOIN prediction_judgments pj ON pj.prediction_id = p.id
+             FROM active_winner a
+             JOIN races r ON r.id = a.race_id
+             LEFT JOIN prediction_judgments pj ON pj.prediction_id = a.id
              LEFT JOIN (
-                 SELECT p2.id AS prediction_id,
+                 SELECT a2.id AS prediction_id,
                         count(t.id) * 100 AS stake,
                         coalesce(sum(po.payout), 0) AS payout
-                 FROM predictions p2
-                 JOIN prediction_tickets t ON t.prediction_id = p2.id AND t.bet_type = ?
+                 FROM active_winner a2
+                 JOIN prediction_tickets t ON t.prediction_id = a2.id AND t.bet_type = ?
                  LEFT JOIN payouts po
-                     ON po.race_id = p2.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
-                 WHERE p2.model_version = ? AND p2.stage = ?
-                 GROUP BY p2.id
-             ) stake_agg ON stake_agg.prediction_id = p.id
-             WHERE p.model_version = ? AND p.stage = ?
+                     ON po.race_id = a2.race_id AND po.bet_type = t.bet_type AND po.combination = t.combination
+                 GROUP BY a2.id
+             ) stake_agg ON stake_agg.prediction_id = a.id
              GROUP BY month
              ORDER BY month",
-            [self::BET_TYPE, $modelVersion, $stage, $modelVersion, $stage]
+            [$stage1Version, $stage2Version, self::BET_TYPE]
         );
 
         return array_map(
@@ -167,8 +208,11 @@ class PerformanceController extends Controller
      */
     public function confidentTop3(): JsonResponse
     {
-        $modelVersion = config('ml.prediction_model_version');
-        $stage = config('ml.prediction_stage');
+        // p_top3は「3着以内モデル」(prediction_top3_model_version)から取得する。
+        // 1着予測モデル(prediction_model_version)とは別のpredictionsレコード
+        // （2026-10-04、2モデル構成に変更。CLAUDE.md「p_top3の直接学習モデル」参照）。
+        $stage1Version = config('ml.prediction_top3_model_version');
+        $stage2Version = config('ml.prediction_stage2_top3_model_version');
         $options = config('ml.top3_confident_threshold_options');
 
         $threshold = (float) request()->query('threshold', config('ml.top3_confident_threshold'));
@@ -177,24 +221,26 @@ class PerformanceController extends Controller
         }
 
         return response()->json([
-            'model_version' => $modelVersion,
+            'model_version' => $stage1Version,
             'threshold' => $threshold,
             'threshold_options' => $options,
-            'overall' => $this->confidentTop3Overall($modelVersion, $stage, $threshold),
-            'daily' => $this->confidentTop3Rows($modelVersion, $stage, $threshold, 'day'),
-            'monthly' => $this->confidentTop3Rows($modelVersion, $stage, $threshold, 'month'),
+            'overall' => $this->confidentTop3Overall($stage1Version, $stage2Version, $threshold),
+            'daily' => $this->confidentTop3Rows($stage1Version, $stage2Version, $threshold, 'day'),
+            'monthly' => $this->confidentTop3Rows($stage1Version, $stage2Version, $threshold, 'month'),
         ]);
     }
 
-    private function confidentTop3Overall(?string $modelVersion, int $stage, float $threshold): array
+    private function confidentTop3Overall(?string $stage1Version, ?string $stage2Version, float $threshold): array
     {
+        $activeTop3 = $this->activePredictionCte();
+
         $row = DB::selectOne(
-            'WITH top_picks AS (
-                 SELECT p.race_id, pe.lane, pe.p_top3,
-                        rank() OVER (PARTITION BY p.race_id ORDER BY pe.p_top3 DESC) AS rnk
+            "WITH active_top3 AS ({$activeTop3}),
+             top_picks AS (
+                 SELECT a.race_id, pe.lane, pe.p_top3,
+                        rank() OVER (PARTITION BY a.race_id ORDER BY pe.p_top3 DESC) AS rnk
                  FROM prediction_entries pe
-                 JOIN predictions p ON p.id = pe.prediction_id
-                 WHERE p.model_version = ? AND p.stage = ?
+                 JOIN active_top3 a ON a.id = pe.prediction_id
              ),
              confident_picks AS (
                  SELECT race_id, lane FROM top_picks WHERE rnk = 1 AND p_top3 >= ?
@@ -203,14 +249,14 @@ class PerformanceController extends Controller
                     count(rr.race_entry_id) FILTER (WHERE rr.finish_pos <= 3) AS n_hit
              FROM confident_picks cp
              JOIN race_entries re ON re.race_id = cp.race_id AND re.lane = cp.lane
-             JOIN race_results rr ON rr.race_entry_id = re.id',
-            [$modelVersion, $stage, $threshold]
+             JOIN race_results rr ON rr.race_entry_id = re.id",
+            [$stage1Version, $stage2Version, $threshold]
         );
 
         return $this->formatConfidentRow((int) $row->n_confident, (int) $row->n_hit);
     }
 
-    private function confidentTop3Rows(?string $modelVersion, int $stage, float $threshold, string $granularity): array
+    private function confidentTop3Rows(?string $stage1Version, ?string $stage2Version, float $threshold, string $granularity): array
     {
         $dateExpr = $granularity === 'month' ? "to_char(race_date, 'YYYY-MM')" : "to_char(race_date, 'YYYY-MM-DD')";
         $keyName = $granularity === 'month' ? 'month' : 'date';
@@ -225,17 +271,19 @@ class PerformanceController extends Controller
             $raceDaysParams = [$start, $end];
         }
 
+        $activeTop3 = $this->activePredictionCte();
+
         $rows = DB::select(
             "WITH race_days AS (
                  SELECT DISTINCT {$dateExpr} AS bucket FROM races {$raceWhere}
              ),
+             active_top3 AS ({$activeTop3}),
              top_picks AS (
-                 SELECT r.race_date, p.race_id, pe.lane, pe.p_top3,
-                        rank() OVER (PARTITION BY p.race_id ORDER BY pe.p_top3 DESC) AS rnk
+                 SELECT r.race_date, a.race_id, pe.lane, pe.p_top3,
+                        rank() OVER (PARTITION BY a.race_id ORDER BY pe.p_top3 DESC) AS rnk
                  FROM prediction_entries pe
-                 JOIN predictions p ON p.id = pe.prediction_id
-                 JOIN races r ON r.id = p.race_id
-                 WHERE p.model_version = ? AND p.stage = ?
+                 JOIN active_top3 a ON a.id = pe.prediction_id
+                 JOIN races r ON r.id = a.race_id
              ),
              confident_picks AS (
                  SELECT race_date, race_id, lane FROM top_picks WHERE rnk = 1 AND p_top3 >= ?
@@ -254,7 +302,7 @@ class PerformanceController extends Controller
              LEFT JOIN judged j ON j.bucket = rd.bucket
              GROUP BY rd.bucket
              ORDER BY rd.bucket DESC",
-            [...$raceDaysParams, $modelVersion, $stage, $threshold]
+            [...$raceDaysParams, $stage1Version, $stage2Version, $threshold]
         );
 
         return array_map(

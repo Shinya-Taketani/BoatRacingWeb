@@ -8,7 +8,7 @@ const loading = ref(true);
 const error = ref(null);
 
 const confident = ref(null);
-const confidentThreshold = ref(0.96);
+const confidentThreshold = ref(0.84);
 const confidentLoading = ref(true);
 const confidentError = ref(null);
 
@@ -98,7 +98,7 @@ const yesterday = computed(() => summary.value?.daily?.[1] ?? null);
                         閾値:
                         <select v-model.number="confidentThreshold" class="rounded border-slate-300 text-sm">
                             <option
-                                v-for="opt in confident?.threshold_options ?? [0.96, 0.97, 0.98, 0.99]"
+                                v-for="opt in confident?.threshold_options ?? [0.80, 0.84, 0.88, 0.92, 0.96]"
                                 :key="opt"
                                 :value="opt"
                             >

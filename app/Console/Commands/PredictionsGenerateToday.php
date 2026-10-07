@@ -7,30 +7,46 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
 
 /**
- * 当日分の特徴量(v1/v2/v3)を生成した上で、保存済みモデルで推論し、
- * predictions / prediction_entries に書き込む。続けて3連単の買い目
- * (tickets:generate-today)も生成する（predictions -> tickets の依存関係が
- * 明確なため、ここでまとめて実行する）。
+ * 当日分の特徴量(v1/v2/v3)を生成した上で、保存済みモデル(1着予測モデル+
+ * 3着以内予測モデルの2本立て)で推論し、predictions / prediction_entries に
+ * 書き込む。続けて3連単の買い目(tickets:generate-today)も生成する
+ * （predictions -> tickets の依存関係が明確なため、ここでまとめて実行する）。
  *
  * stage は当面1のみ（締切直前の再予測=stage2は未実装）。
+ *
+ * 2026-10-04、1着予測モデルと3着以内予測モデルの2本立てに変更した
+ * （CLAUDE.md「p_top3の直接学習モデル」参照）。tickets:generate-todayは
+ * p_firstしか使わないため、--model-versionは引き続き1着予測モデルの
+ * バージョンだけを渡せばよい。
  */
 class PredictionsGenerateToday extends Command
 {
     protected $signature = 'predictions:generate-today
         {date? : YYYY-MM-DD（省略時は本日）}
-        {--model-version= : 省略時は config(ml.prediction_model_version) / .envのPREDICTION_MODEL_VERSION}';
+        {--model-version= : 1着予測モデル。省略時は config(ml.prediction_model_version)}
+        {--top3-model-version= : 3着以内予測モデル。省略時は config(ml.prediction_top3_model_version)}';
 
-    protected $description = '当日分の特徴量を生成し、モデルで推論してpredictions/prediction_entriesに書き込む';
+    protected $description = '当日分の特徴量を生成し、2モデル(1着予測/3着以内予測)で推論してpredictions/prediction_entriesに書き込む';
 
     public function handle(): int
     {
         $date = $this->argument('date') ?? RaceDate::today();
         $modelVersion = $this->option('model-version') ?: config('ml.prediction_model_version');
+        $top3ModelVersion = $this->option('top3-model-version') ?: config('ml.prediction_top3_model_version');
 
         if (! $modelVersion) {
             $this->error(
                 'model_version が指定されていません。--model-version か、'
                 .'.envのPREDICTION_MODEL_VERSION(config(ml.prediction_model_version))を設定してください。'
+            );
+
+            return self::FAILURE;
+        }
+
+        if (! $top3ModelVersion) {
+            $this->error(
+                'top3_model_version が指定されていません。--top3-model-version か、'
+                .'.envのPREDICTION_TOP3_MODEL_VERSION(config(ml.prediction_top3_model_version))を設定してください。'
             );
 
             return self::FAILURE;
@@ -44,11 +60,14 @@ class PredictionsGenerateToday extends Command
             return self::FAILURE;
         }
 
-        $this->info("Predicting {$date} with model_version={$modelVersion}...");
+        $this->info("Predicting {$date} with model_version={$modelVersion} top3_model_version={$top3ModelVersion}...");
 
         $result = Process::path(base_path('ml'))
             ->timeout(300)
-            ->run([config('ml.uv_binary'), 'run', 'python', '-m', 'ml.models.predict', $modelVersion, $date]);
+            ->run([
+                config('ml.uv_binary'), 'run', 'python', '-m', 'ml.models.predict',
+                $modelVersion, $top3ModelVersion, $date,
+            ]);
 
         foreach (explode("\n", trim($result->output())) as $line) {
             if ($line !== '') {

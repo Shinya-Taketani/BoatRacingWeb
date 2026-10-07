@@ -29,6 +29,11 @@ CRLF区切り）。program.py（番組表(B)）と対になるファイルで、
 "L ."（K の "K ." と同じ「値なし」表記）であることを確認しており、
 出遅れは信号後に有効なSTが計測されないため欠損(None)として扱う
 （Fのような数値+符号反転ではない）。
+
+中止レース（荒天等）は着順ブロック自体が存在せず、場ヘッダ内の[払戻金]
+概況表に「5R  中止」の形でのみ記録される。このレースは results/payouts
+どちらにも現れないため、別途 ParsedResult.cancelled に (stadium_code,
+race_date, race_no) として記録する。
 """
 
 from __future__ import annotations
@@ -75,6 +80,11 @@ _STADIUM_MARK_RE = re.compile(r"^(\d{2})K(BGN|END)$")
 _DATE_RE = re.compile(r"第\s*\d+日\s+(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})")
 _RACE_HEADER_RE = re.compile(r"^\s*(\d{1,2})R\s+.*?H\d+m")
 _RACE_TIME_RE = re.compile(r"^(\d+)\.(\d{2})\.(\d)$")
+# 中止レース: 場ヘッダ内の[払戻金]概況表に「  5R  中　止」の形で現れる
+# （全角スペースはNFKC正規化後は半角1個になる）。このレースには着順ブロック
+# (NR形式の見出し+6行)自体が存在しないため、通常の着順パースでは検出できず、
+# この概況表の行でのみ判定できる。
+_CANCELLED_RACE_RE = re.compile(r"^\s*(\d{1,2})R\s+中\s*止\s*$")
 
 # 払戻金明細（自由形式）: 行頭に式別ラベルがある場合とない場合(複勝の2件目、
 # 拡連複の2・3件目)があるため、ラベル検出とフィールド抽出を分けて行う。
@@ -119,9 +129,19 @@ class PayoutRecord:
 
 
 @dataclass(frozen=True)
+class CancelledRaceRecord:
+    """中止レース1件（race_entries/race_resultsは存在しない）。"""
+
+    stadium_code: int
+    race_date: date
+    race_no: int
+
+
+@dataclass(frozen=True)
 class ParsedResult:
     results: list[RaceResultRecord]
     payouts: list[PayoutRecord]
+    cancelled: list[CancelledRaceRecord]
 
 
 def parse_result_path(path) -> ParsedResult:
@@ -134,6 +154,7 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
     lines = raw.split(b"\r\n")
     results: list[RaceResultRecord] = []
     payouts: list[PayoutRecord] = []
+    cancelled: list[CancelledRaceRecord] = []
     n = len(lines)
 
     def text_at(idx: int) -> str:
@@ -202,6 +223,13 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
         # レースは1つも無く、次の {code}KEND に直接到達する。この場合はこの場を
         # 0件として次の場ブロックへ進む（黙ってスキップするのではなく、
         # 対応する終了マーカーであることは確認した上で許容する）。
+        #
+        # 場ヘッダ内の[払戻金]概況表（1R〜12R全てを一覧表示する自由形式）は、
+        # 開催日の行から最初のNR形式レース見出しの直前までに必ず1回だけ現れる
+        # （一部のレースのみ開催された場合も、概況表はこの位置に1回だけ
+        # まとめて出る）。中止レースは「 5R  中　止」の形でこの区間にのみ
+        # 現れ、NR形式の見出し自体が存在しないため、ここで拾っておかないと
+        # 二度と検出できない。
         no_races_this_stadium = False
         while not _RACE_HEADER_RE.match(normalized_at(i)):
             end_m = _STADIUM_MARK_RE.match(text_at(i))
@@ -214,6 +242,15 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
                 i += 1
                 no_races_this_stadium = True
                 break
+            cancel_m = _CANCELLED_RACE_RE.match(normalized_at(i))
+            if cancel_m:
+                cancelled.append(
+                    CancelledRaceRecord(
+                        stadium_code=stadium_code,
+                        race_date=race_date,
+                        race_no=int(cancel_m.group(1)),
+                    )
+                )
             i += 1
             if i >= n:
                 raise ResultParseError("race header not found before end of file")
@@ -313,7 +350,7 @@ def parse_result_bytes(raw: bytes) -> ParsedResult:
             if stadium_done:
                 break
 
-    return ParsedResult(results=results, payouts=payouts)
+    return ParsedResult(results=results, payouts=payouts, cancelled=cancelled)
 
 
 def _parse_result_line(

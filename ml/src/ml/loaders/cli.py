@@ -34,7 +34,7 @@ from ml.loaders.races import upsert_races_and_entries
 from ml.loaders.racer_periods import CompactionError, compact_racer_periods
 from ml.loaders.racer_snapshots import upsert_daily_snapshots
 from ml.loaders.results import LoaderError as ResultLoaderError
-from ml.loaders.results import upsert_race_results
+from ml.loaders.results import mark_cancelled_races, upsert_race_results
 from ml.parsers.program import ProgramParseError, parse_program_path
 from ml.parsers.result import ResultParseError, parse_result_path
 
@@ -132,6 +132,9 @@ def _load_results_pipeline(conn, k_path: Path) -> None:
 
     payout_load = upsert_payouts(conn, parsed_result.payouts)
     print(f"payouts: upserted {payout_load.payouts_upserted}")
+
+    cancelled_load = mark_cancelled_races(conn, parsed_result.cancelled)
+    print(f"races: marked cancelled {cancelled_load.races_marked_cancelled}")
 
 
 def _cmd_load_results(args: argparse.Namespace) -> int:

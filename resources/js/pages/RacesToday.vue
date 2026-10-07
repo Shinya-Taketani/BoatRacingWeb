@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { fetchRacesToday } from '../api';
 import { formatPercent, formatTime } from '../format';
 import ConfidenceBadge from '../components/ConfidenceBadge.vue';
+import BeforeInfoBadge from '../components/BeforeInfoBadge.vue';
 
 const races = ref([]);
 const loading = ref(true);
@@ -43,7 +44,8 @@ const sortedByDeadline = computed(() =>
     [...races.value].sort((a, b) => new Date(a.deadline_at) - new Date(b.deadline_at))
 );
 
-// 3着内確実な艇: p_top3がconfig('ml.top3_confident_threshold')(現在96%)以上の艇。
+// 3着内確実な艇: p_top3がconfig('ml.top3_confident_threshold')(現在84%、
+// is_top3直接学習モデル由来。2026-10-04切替)以上の艇。
 // 締切が近い順に最大10件。
 const confidentTop3Races = computed(() =>
     sortedByDeadline.value.filter((r) => r.confident_top3_lane !== null && !isPast(r)).slice(0, 10)
@@ -97,7 +99,7 @@ const groupedListByStadium = computed(() => {
             <section v-if="confidentTop3Races.length > 0">
                 <h2 class="mb-1 text-lg font-semibold">3着内確実な艇</h2>
                 <p class="mb-3 text-xs text-slate-500">
-                    3着以内に入る確率が96%以上の艇。検証期間で実績90.4%（22,429艇中20,270艇的中）。
+                    3着以内に入る確率が84%以上の艇。検証期間で実績90.4%（22,303艇中20,154艇的中）。
                 </p>
                 <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     <div
@@ -108,7 +110,10 @@ const groupedListByStadium = computed(() => {
                     >
                         <div class="flex items-center justify-between">
                             <span class="font-semibold text-slate-800">{{ race.stadium_name }} {{ race.race_no }}R</span>
-                            <span class="text-xs text-slate-500">締切 {{ formatTime(race.deadline_at) }}</span>
+                            <div class="flex items-center gap-1.5">
+                                <BeforeInfoBadge v-if="race.uses_before_info" compact />
+                                <span class="text-xs text-slate-500">締切 {{ formatTime(race.deadline_at) }}</span>
+                            </div>
                         </div>
                         <p class="mt-3 text-2xl font-bold text-sky-700">
                             {{ race.confident_top3_lane }}号艇
@@ -134,7 +139,10 @@ const groupedListByStadium = computed(() => {
                     >
                         <div class="flex items-center justify-between">
                             <span class="font-semibold text-slate-800">{{ race.stadium_name }} {{ race.race_no }}R</span>
-                            <ConfidenceBadge :grade="race.confidence_grade" />
+                            <div class="flex items-center gap-1.5">
+                                <BeforeInfoBadge v-if="race.uses_before_info" compact />
+                                <ConfidenceBadge :grade="race.confidence_grade" />
+                            </div>
                         </div>
                         <p class="mt-1 text-sm text-slate-500">締切 {{ formatTime(race.deadline_at) }}</p>
                         <p class="mt-3 text-2xl font-bold text-amber-700">
@@ -160,7 +168,10 @@ const groupedListByStadium = computed(() => {
                     >
                         <div class="flex items-center justify-between">
                             <span class="font-semibold text-slate-800">{{ race.stadium_name }} {{ race.race_no }}R</span>
-                            <ConfidenceBadge :grade="race.confidence_grade" />
+                            <div class="flex items-center gap-1.5">
+                                <BeforeInfoBadge v-if="race.uses_before_info" compact />
+                                <ConfidenceBadge :grade="race.confidence_grade" />
+                            </div>
                         </div>
                         <p class="mt-1 text-sm text-slate-500">締切 {{ formatTime(race.deadline_at) }}</p>
                         <p class="mt-3 text-2xl font-bold text-emerald-700">
@@ -186,7 +197,10 @@ const groupedListByStadium = computed(() => {
                     >
                         <div class="flex items-center justify-between">
                             <span class="font-semibold text-slate-800">{{ race.stadium_name }} {{ race.race_no }}R</span>
-                            <span class="text-xs text-slate-500">締切 {{ formatTime(race.deadline_at) }}</span>
+                            <div class="flex items-center gap-1.5">
+                                <BeforeInfoBadge v-if="race.uses_before_info" compact />
+                                <span class="text-xs text-slate-500">締切 {{ formatTime(race.deadline_at) }}</span>
+                            </div>
                         </div>
                         <div class="mt-3 flex items-baseline justify-between">
                             <div>
@@ -251,7 +265,10 @@ const groupedListByStadium = computed(() => {
                                         :class="isPast(race) ? 'bg-slate-50/60 text-slate-400' : ''"
                                         @click="$router.push(`/races/${race.id}`)"
                                     >
-                                        <td class="px-3 py-2 font-medium">{{ race.race_no }}R</td>
+                                        <td class="px-3 py-2 font-medium">
+                                            {{ race.race_no }}R
+                                            <BeforeInfoBadge v-if="race.uses_before_info" compact class="ml-1 align-middle" />
+                                        </td>
                                         <td class="px-3 py-2">{{ formatTime(race.deadline_at) }}</td>
                                         <td class="px-3 py-2">
                                             <span v-if="race.top_lane">

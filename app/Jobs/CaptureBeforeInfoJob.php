@@ -85,6 +85,10 @@ class CaptureBeforeInfoJob implements ShouldQueue
             'course_predicted' => $b['course_predicted'],
             'st_exhibit' => $b['st_exhibit'],
             'captured_at' => $result->capturedAt,
+            // このジョブは締切T-12分の予約実行なので、captured_atは常に
+            // 実際の公開時刻に近い「ライブ取得」。バックフィル(過去分の後日取得)
+            // とは区別する(ml.features.exhibitionのリーク検証がsourceで分岐する)。
+            'source' => 'live',
             'created_at' => now(),
             'updated_at' => now(),
         ], array_values($result->boats));
@@ -94,7 +98,8 @@ class CaptureBeforeInfoJob implements ShouldQueue
             ['race_id', 'lane'],
             [
                 'weight', 'adjusted_weight', 'exhibit_time', 'tilt', 'propeller_changed',
-                'parts_exchanged', 'course_predicted', 'st_exhibit', 'captured_at', 'updated_at',
+                'parts_exchanged', 'course_predicted', 'st_exhibit', 'captured_at', 'source',
+                'updated_at',
             ],
         );
     }

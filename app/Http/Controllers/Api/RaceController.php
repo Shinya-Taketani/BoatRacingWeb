@@ -13,7 +13,14 @@ class RaceController extends Controller
 {
     public function today(): AnonymousResourceCollection
     {
-        $races = Race::with(['stadium', 'prediction.entries', 'raceEntries.result'])
+        $races = Race::with([
+            'stadium',
+            'prediction.entries',
+            'top3Prediction.entries',
+            'stage2Prediction.entries',
+            'stage2Top3Prediction.entries',
+            'raceEntries.result',
+        ])
             ->whereDate('race_date', RaceDate::today())
             ->orderBy('deadline_at')
             ->get();
@@ -31,6 +38,11 @@ class RaceController extends Controller
             'prediction.entries',
             'prediction.tickets',
             'prediction.judgment',
+            'top3Prediction.entries',
+            'stage2Prediction.entries',
+            'stage2Prediction.tickets',
+            'stage2Prediction.judgment',
+            'stage2Top3Prediction.entries',
         ]);
 
         return new RaceDetailResource($race);

@@ -166,6 +166,730 @@
   - 問い合わせ窓口: `https://www.boatrace.jp/owpc/pc/support/opinion`
     （サイトポリシーページ記載の「お問い合わせフォーム」）
 
+### Python版fetch/load/backfill実装（2026-09-23、実行はまだしていない）
+- 一時停止中のステータスを維持したまま、PHP版とは別にPython側の実装だけ
+  先に進めた（ユーザーの明示判断）。財団からの許諾が取れるまで実際の
+  リクエストは送らない。
+- `ml/src/ml/fetchers/beforeinfo.py`：HTML取得(`fetch_before_info_html`/
+  `fetch_before_info`)とパース(`parse_before_info_html`)を分離。パースは
+  ネットワークなしでテスト可能。`BeforeInfoScraper.php`と同じ固定レイアウト
+  前提（17列td・`table.is-w238`のコース行対応・`div.weather1`）を移植。
+  HTML解析に`beautifulsoup4`+`lxml`を`uv add`で追加（ml側に無かった依存）。
+- `ml/src/ml/loaders/beforeinfo.py`：`race_before_info`/`race_weather_info`
+  へON CONFLICT upsert。対応する`race_entries`(race_id, lane)が無い場合は
+  `LoaderError`を送出し黙って捨てない。
+- `ml/src/ml/fetchers/beforeinfo_backfill.py`：`races`を`race_date`降順
+  （新しい日付優先）で処理し、JSON状態ファイルで中断・再開、失敗は記録して
+  継続。nohupでのバックグラウンド実行前提。
+- 動作確認：調査時のbeforeinfo生HTMLは保存しておらず(`/tmp`等に残存なし)
+  再取得もしていないため、`ml/tests/_beforeinfo_fixtures.py`の固定HTML
+  フィクスチャ（lane1の展示タイム6.97・体重53.3kg・チルト-0.5等は実際の
+  調査報告の観測値を採用）でパーサを検証（`test_beforeinfo_parser.py`、
+  11件）。DB投入は同フィクスチャの解析結果を使い、実PostgreSQL
+  （テスト専用race_date=2099-01-01、テスト終了時にcascade削除）で
+  upsert・冪等性・race_entries欠如時の例外を検証（`test_beforeinfo_loader.py`、
+  3件）。ml側テスト全53件パス。
+
+### 2026-09-19分の実データ取得と応答時間の訂正（2026-09-27、財団許諾未取得のままユーザー判断でリスク受容し実行）
+- 1日分(156レース)を実行し、`race_before_info`936行・`race_weather_info`156行
+  を投入。全156件成功（失敗0）。展示タイム中央値6.8秒（分布6.47〜7.09秒）で
+  事前予想と一致、体重39.5〜59.1kg、チルト-0.5〜3.0、st_exhibit 0.00〜0.49、
+  parts_exchangedは実在の部品名（リング×２/ギヤ/ピストン×２,シャフト等）で
+  実データと確認。フィクスチャ前提の17列固定レイアウトはパース例外0件。
+- **重要な訂正**：「サーバー応答が遅くこれ自体がレート制御になる」という
+  上記(2026-09-21時点)の前提は誤りだったと判明した。1日分バックフィルが
+  156件を33秒（平均0.21秒/件）で完了し、当初想定(9.5秒/件)と大きく矛盾した
+  ため検証したところ：
+  - `curl`で同一URLを再取得: 8〜10秒（従来の実測値と一致、HTTP/1.1強制でも
+    10.16秒・HTTP/2で8.49秒なのでHTTP/2起因ではない）
+  - 本スクリプトが使うPython `urllib.request` 経由（プロジェクトコードから
+    独立に検証）: 同一URL・同一内容が0.2〜0.3秒で返る
+  - 取得内容自体はcurl/urllibで完全一致（実際の値を相互確認済み）しており
+    データの正当性に問題はない
+  - 原因不明のツール依存差（TLSフィンガープリント差など未特定）。
+    **サーバー自体は速く**、「応答の遅さ＝事実上のレート制御」という前提は
+    崩れた。明示的なsleepなしでは短時間に大量リクエストを送る形になり、
+    「大量アクセス」リスクをむしろ高める
+  - 対策として`beforeinfo_backfill`の`--sleep-seconds`既定値を**0秒→2.0秒**
+    に変更（2026-09-27）
+- **所要時間の再計算**（sleep=2.0秒 + 実測fetch時間0.2〜0.3秒/件、
+  1件あたり計約2.2〜2.3秒として計算）:
+  - 3ヶ月分(2026-06-21〜09-20、実データ14,772件): **約9.0〜9.4時間**
+    （旧見積り: 9.5秒/件換算で約39時間だったので、旧見積りより大幅に短縮）
+  - 参考: 全期間(2023-09-01〜2026-09-20、170,880件)なら**約4.4〜4.6日**
+    （旧見積りの「約450時間(≒19日)」から大幅に短縮。ただし全期間実行は
+    別途判断が必要、現時点では3ヶ月分のみが検討対象）
+
+### 3ヶ月分バックフィル完了（2026-06-21〜09-20、2026-09-27）
+- 対象14,772レース全件成功。`race_before_info` 88,632行(14,772×6)、
+  `race_weather_info` 14,772行を投入し、件数・カバレッジとも欠落なしで一致
+  確認済み（sleep=2.0秒、所要9時間35分）。
+- 実行中に1件、新種のパースバグを発見・修正した。`jcd=23,rno=4,hd=20260622`
+  で`ValueError("invalid literal for int() with base 10: ''")`が発生。原因は
+  スタート展示テーブル(`table.is-w238`)で、枠が展示不参加(欠場等)の場合に
+  艇番spanの要素自体は残り中身が`&nbsp;`(`\xa0`)のみになるケースがあり、
+  フィクスチャはこれを想定していなかったため。`_merge_exhibit_start()`で
+  nbsp除去後に空文字なら「このコースに艇なし」として安全にスキップする
+  よう修正(`ml/src/ml/fetchers/beforeinfo.py`)。回帰テストを
+  `test_beforeinfo_parser.py::test_exhibit_absent_lane_leaves_nbsp_only_span_without_raising`
+  に追加、`--retry-failed`で26件(この1件+一時的なDNS解決失敗25件)を
+  再取得し全件成功。ml側テスト全54件パス。
+- 本番モデルの特徴量・学習にはまだ使わない（記録のみの方針は継続、
+  上記「直前情報(beforeinfo)の取得」の当初方針どおり）。
+
+### captured_at の意味とsource列の追加（2026-09-27、v5_exhibition生成時に発覚）
+- `race_before_info.captured_at` は「取得した時刻」であって「サイトが公開した
+  時刻」ではない。ライブ取得(締切T-12分の予約ジョブ)ではこの2つはほぼ一致
+  するが、バックフィル(過去分を後日まとめて取得)ではcaptured_atが取得作業を
+  行った日時になり、対象レースの締切よりずっと後になる。実際、上記3ヶ月分
+  バックフィルの88,632行全件で`captured_at > deadline_at - 10分`となって
+  いた（v5_exhibition特徴量のリーク検証で発覚。1件だけの偶然ではなく
+  全件がこの状態だった）。
+- `race_before_info` に `source` 列(`'live'` / `'backfill'`)を追加し
+  （migration: `2026_09_27_100001_add_source_to_race_before_info_table.php`）、
+  取得経路を明示的に区別できるようにした。既存行のうち3ヶ月分の88,632行は
+  `'backfill'`。もともと財団確認待ちで一時停止する直前に記録されていた
+  6行(race_id=185402、2026-09-21分)は、実際にはライブ取得(締切T-12分の
+  予約ジョブ)によるcaptured_atが締切の約10分16秒前という妥当な値だった
+  ため、`'live'`に修正済み。`app/Jobs/CaptureBeforeInfoJob.php`（PHP、
+  ライブ取得経路）と`ml/src/ml/loaders/beforeinfo.py::load_before_info()`
+  （Python、`source`を必須キーワード引数化、backfillスクリプト側で
+  `source="backfill"`を明示）の両方で、以後は必ずsourceを明示する。
+- リーク検証(`ml/src/ml/features/exhibition.py`)はsourceで分岐する:
+  - `source='live'`: 従来通り`captured_at <= cutoff_at(=deadline_at-10分)`
+    を機械的に検証する(`ml.cutoff.assert_no_leak`)。
+  - `source='backfill'`: captured_atでの検証はスキップする。根拠は
+    captured_atではなく「beforeinfoは締切T-14〜16分に公開され、締切後も
+    ページの内容が変わらない」という実測済みのサイト挙動そのもの
+    （上記「直前情報(beforeinfo)の取得」参照）。「データがありません」に
+    ならず値が取得できている時点で、その内容は締切前に公開されていた
+    ものだと保証される、という論拠。
+  - `race_weather_info`にはsource列を追加していない。天候は艇情報と同じ
+    ページ・同じ取得タイミングで得られるため、同一レースの
+    `race_before_info.source`で代表させる。
+- 今後ライブ取得(`beforeinfo:schedule-today`)を財団許諾後に再開すれば、
+  以降に記録される行は`source='live'`となり、厳格なcaptured_at検証が
+  自動的に効くようになる。
+
+## v5_exhibition 特徴量（2026-09-27）
+- 直前情報(beforeinfo)由来の展示・気象特徴量。`ml/src/ml/features/exhibition.py`。
+  展示タイム/そのレース内順位/レース平均との差、st_exhibit/そのレース内順位、
+  course_predicted、tilt、exhibit_weight/exhibit_adjusted_weight（直前計量の
+  実測値。v1_basic.weightは番組表発表時点の公表体重で別物のため同名衝突を
+  避けてexhibit_接頭辞を付けた。当初"weight"のまま実装し、polarsの
+  select時にDuplicateErrorで発覚・修正）、プロペラ/部品交換の有無(0/1)、
+  気象6項目(気温・風速・風向コード・波高・水温・天候コード)の計17特徴量。
+  天候コードはWEATHER_CONDITION_CODES(晴=0/曇り=1/雨=2、実データで観測
+  された値のみ明示マッピング、未知の値はNoneで当て推量しない)、風向コードは
+  実際の方角との対応が未確定(前述参照)なのでLightGBMのcategorical_feature
+  として扱う(course_predictedと同じ理由で名義尺度扱い)。
+- リーク検証は`race_before_info.source`で分岐する（詳細は上記
+  「captured_at の意味とsource列の追加」参照）。現在の3ヶ月分は全件
+  `source='backfill'`のため、captured_atでの機械的検証ではなく
+  サイト挙動(締切T-14〜16分公開・締切後不変)を根拠にしている。
+- データが存在する2026-06-21〜09-20のみで検証。本番モデルの学習・検証期間
+  (2023-09-01〜2025-12-31 / 2026-01-01〜09-17)とは別に、この実験専用の
+  時系列split(学習: 06-21〜08-20、9,936レース / 検証: 08-21〜09-20、
+  4,836レース)を`ml/src/ml/models/exhibition_experiment.py`で使う。
+  **検証期間が約1ヶ月と短く、本番の検証期間(約8.5ヶ月)に比べて代表性は
+  限定的**な点に注意。
+- **v1+v2+v3 と v1+v2+v3+v5 の比較（この専用split、binary、同一パラメータ）**:
+  的中率 55.36%→55.54%(+0.19pt)、log loss 1.2359→1.2196(-0.0163)、
+  Brier 0.6002→0.5944(-0.0058)。**v4_stadiumの時は改善なしだったが、v5は
+  3指標とも一貫して改善**（motor_win_rate_2修正やハイパーパラメータ
+  チューニングの改善幅よりさらに大きい）。feature importanceでは
+  `course_predicted`が5位、`exhibit_time_dev_from_race_avg`が6位に入るなど
+  v5特徴量が上位に複数入っており、既存特徴量と重複せず新しい情報を
+  提供していると考えられる。欠損率も0.02〜0.42%と低く実用的なカバレッジ。
+- confident_top3(p_top3>=96%、CLAUDE.md「p_top3の精度検証」参照)でも比較:
+  該当数3,077→3,180件(+103件)、実績的中率88.30%→88.43%(+0.13pt)。
+  該当数・精度の両方が同時に改善しており、量と質のトレードオフではない。
+- 本番モデルへの組み込みはまだ行っていない（ユーザー判断待ち）。財団への
+  利用許諾確認が未解決のままbeforeinfoのバックフィルを続行し特徴量化した
+  経緯を踏まえ、本番投入の可否は別途判断が必要。
+
+### 全期間バックフィル完了とv5の本番split検証（2026-10-03）
+- beforeinfoのバックフィルを1年単位で4回に分けて実施し、DB上の全レース
+  (2023-09-01〜2026-10-03、172,896レース)を完全にカバーした。各回とも
+  パースバグは0件（3ヶ月分の時に見つかった`&nbsp;`ケース修正で解消済み）、
+  失敗は全て一時的なDNS解決失敗で`--retry-failed`により最終的に全件成功。
+  `race_before_info` 1,037,376行(172,896×6)・`race_weather_info` 172,896行、
+  races総数と完全一致を確認済み。
+- v5_exhibitionを全期間で再生成し、**本番と同じ時系列split**
+  (学習2023-09-01〜2025-12-31・129,684レース / 検証2026-01-01〜09-17・
+  40,692レース)で比較。短期間split(1ヶ月検証)の時より改善幅が明確に拡大:
+
+  | | 的中率 | log loss | Brier |
+  |---|---|---|---|
+  | A) v1+v2+v3 | 56.20% | 1.1974 | 0.5834 |
+  | B) v1+v2+v3+v5 | 56.69% | 1.1799 | 0.5751 |
+  | 差分 | +0.49pt | **-0.0175** | **-0.0083** |
+
+  motor_win_rate_2修正・ハイパーパラメータチューニング・v4_stadiumいずれの
+  改善幅も上回る、これまでで最大の改善。feature importanceでは
+  **`course_predicted`が全特徴量中1位**(gain=556,051.6、2位の
+  `lane_win_rate_recent50_rank`の約3倍)となり、支配的な特徴量になっている。
+  `exhibit_time_dev_from_race_avg`も6位。欠損率は0.6〜1.3%と低い。
+- **confident_top3(p_top3>=96%)の比較（2026-10-03、手法を本番APIに合わせて修正後の値）**:
+
+  | | 該当数 | 実績3着以内率 |
+  |---|---|---|
+  | A) v1+v2+v3 | 22,428 | 90.37% |
+  | B) v1+v2+v3+v5 | 23,115 | 90.50% |
+  | 差分 | +687 | +0.13pt |
+
+  初回実測時はA=89.38%(22,914件)となり、2026-09-21出荷時の実績
+  (90.37%、22,429件)と食い違っていたため原因を調査した。
+  `ml/src/ml/models/exhibition_experiment.py`の`_confident_top3_report()`に
+  本番API(`PerformanceController::confidentTop3Overall()`)との
+  **2点のメソッド差異**があったことが原因と判明（モデルの差・判定データの
+  更新ではない）:
+  1. 本番は「レースごとにp_top3が最大の1艇だけ」を候補にし、その1艇が
+     閾値以上かを見る(`rank() OVER (...) WHERE rnk=1`)。初回実装は
+     レース内の順位を無視し、p_top3>=閾値を満たす艇を全艇カウントして
+     いたため、同一レースで複数艇が閾値を超えるケースを余分に数えて
+     母数・的中率の両方がズレていた。
+  2. 本番は`race_results`にINNER JOINしており、結果行が存在しない艇は
+     分母からも除外される。初回実装はLEFT JOINの結果(finish_pos NULL)を
+     「失格でNULL」も「行自体が無い」も同じ0扱いにしており、後者を
+     誤って分母に含めていた。
+  この2点を修正し(`fetch_all_dataset`/`fetch_v5_dataset`に
+  `has_result_row`列を追加して判別可能にした)、A)を本番splitで
+  再実測したところ22,428件・90.37%となり、2026-09-21の実績
+  (22,429件・90.37%)と1件差（丸め誤差の範囲）で一致した。
+  **結論: 本番側(`PerformanceController`)の実装は正しく、修正が必要
+  だったのはこのml/実験スクリプト側のみ**。v5導入によるconfident_top3への
+  真の効果は、的中率+0.13pt・該当数+687件で、A/Bとも既に90%を超えている
+  （「Bで初めて90%を超えた」という初回の解釈は誤りだったので撤回する）。
+- 本番モデルへの組み込みはまだ行っていない（ユーザー判断待ち）。
+
+### v5モデルの推論時欠損耐性の検証（2026-10-03）— ライブ取得停止中は本番投入不可
+- ライブ取得(beforeinfo)が財団許諾待ちで停止中の間にv5モデルを本番投入した
+  場合を想定し、本番splitで3パターンを比較した
+  (`ml/src/ml/models/exhibition_experiment.py`):
+  - A) v1+v2+v3（v5なしで学習・推論）
+  - B) v1+v2+v3+v5（v5あり、通常の学習・推論）
+  - C) v1+v2+v3+v5**で学習**した同じboosterに対し、**推論時だけv5の
+    全列をNaNにして**予測（ライブ取得停止中に新規レースを推論する状況を模す）
+
+  | | 的中率 | log loss | Brier | confident_top3該当数 | confident_top3実績 |
+  |---|---|---|---|---|---|
+  | A) v5なし | 56.20% | 1.1974 | 0.5834 | 22,428 | 90.37% |
+  | B) v5あり(通常) | 56.69% | 1.1799 | 0.5751 | 23,115 | 90.50% |
+  | C) v5あり学習→推論時v5=NaN | **31.07%** | **1.6544** | **0.7820** | **133** | **47.37%** |
+
+  **Cは全指標でAより大幅に悪化し、特にconfident_top3は実質機能しなくなる**
+  （該当数が22,428→133に激減し、残った133件の実績的中率も47.37%で
+  「90%保証」が完全に崩壊する）。LightGBMは欠損値をネイティブに扱えるが、
+  学習時にv5の欠損率が0.6〜1.3%程度しかなかったため、モデルが
+  `course_predicted`(重要度1位、gain=556,051.6、2位の約3倍)を筆頭に
+  v5特徴量へ強く依存する分岐を多数学習しており、推論時に欠損率が
+  100%になると学習時の欠損パターンの想定から大きく外れ、分岐の既定方向
+  (欠損時のデフォルト経路)が系統的に誤った方へ送られるため。
+  「v5特徴量が使えなければv1+v2+v3相当の性能に自然劣化する」という
+  楽観的な想定は誤りで、**実際には素のv1+v2+v3モデルより明確に悪化する**。
+- **結論：ライブ取得(beforeinfo)が停止中の間は、v5を含むモデルを本番に
+  投入してはならない**。v5モデルを投入する場合は、将来レースに対して
+  常にv5特徴量が実際に取得できている状態（ライブ取得が財団許諾を得て
+  再稼働していること）が前提条件になる。もしライブ取得が将来止まった
+  場合に備えるなら、v5欠損時にv1+v2+v3モデルへ自動フォールバックする
+  仕組みが必要（現状未実装）。
+
+## p_top3の直接学習モデル（2026-10-03）
+- `ml/src/ml/models/top3.py`。目的変数をis_winner(1着)ではなく
+  is_top3(finish_posが1,2,3のいずれか)に変えて直接二値分類で学習し、
+  現行手法(is_winnerモデル→Plackett-Luce展開でp_top3を導出)と比較した。
+  特徴量(v1+v2+v3)・split(本番と同じ)・パラメータは完全に揃え、
+  目的変数だけを変えている。正規化はAが合計1(1着予測の性質)、Bは
+  合計3(3着以内は必ず3艇)。Bの素のシグモイド出力は艇間に制約が無いため、
+  正規化後に値が[0,1]を超えることがある(244,152件中1,323件=0.54%で発生、
+  log loss/Brier計算時は[eps,1-eps]にクリップして計算)。
+- **艇単位の3着以内的中率**(上位3艇選択): A) 68.42%(83,521/122,076) →
+  B) 68.84%(84,041/122,076)。+0.42ptの僅かな改善。
+- **log loss/Brier**(is_top3を2値ラベルとした艇単位評価): A) 0.6034/0.2020
+  → B) 0.5763/0.1934。Bが両方で改善。
+- **confident_top3(本番API定義、閾値0.96)**: A) 22,428件・90.37% →
+  B) 3,909件・**94.60%**。Bは該当数が大きく減る代わりに、該当した場合の
+  精度はAより明確に高い。
+- **閾値スイープ**(0.90/0.92/0.94/0.96/0.98、本番API定義):
+
+  | threshold | A:該当数 | A:実績 | B:該当数 | B:実績 |
+  |---|---|---|---|---|
+  | 0.90 | 33,179 | 86.69% | 12,024 | 92.41% |
+  | 0.92 | 30,670 | 87.54% | 8,817 | 93.16% |
+  | 0.94 | 27,365 | 88.82% | 6,080 | 93.78% |
+  | 0.96 | 22,428 | 90.37% | 3,909 | 94.60% |
+  | 0.98 | 13,212 | 92.46% | 2,351 | 95.36% |
+
+  **Bはスイープした最低閾値(0.90)でも既に92.41%で90%を超えている**ため、
+  今回の範囲(0.90〜0.98)だけでは「実績90%を超える最小の閾値」は特定できて
+  いない。実際の交差点はテストした範囲の外(0.90未満)にある可能性が高く、
+  より広い範囲（例: 0.70〜0.90を0.02刻み等）で追加のスイープが必要。
+  AとBの確率スケールは直接比較できない点に注意（Bの0.90はAの0.96超えより
+  実績精度が高い＝Bの方が同じ数値でも「保証」として強い）。
+- **feature importance**: 1着予測(A)と3着以内予測(B)で寄与する特徴量が
+  明確に異なる。Aは`lane`(枠番)が1位(gain=496,651.8、2位の2倍以上)で
+  構造的な「1号艇優位」が1着予測を支配するが、Bでは`lane`は3位
+  (gain=103,815.7、Aの約1/5)に後退し、`lane_win_rate_recent50_rank`
+  (選手個人の枠番別成績の順位)・`national_win_rate_dev`が1・2位を占める。
+  また`avg_finish_pos_recent10`はAで20位だがBでは7位に上昇しており、
+  直近の平均着順という「着順そのもの」に近い特徴量は、1着という
+  狭い的中よりも3着以内という緩い基準の予測に効きやすいと考えられる。
+- 本番モデルへの組み込みはまだ行っていない（ユーザー判断待ち）。v5と同様、
+  推論時の欠損耐性やconfident_top3の運用方針（Bを使うなら閾値の再設計が
+  必要）は別途検討が必要。
+
+### Bの閾値スイープを下方向(0.70〜0.90)に拡張（2026-10-03）
+- `uv run python -m ml.models.top3 --low-sweep`で0.70〜0.90を0.02刻みで
+  追加検証した結果:
+
+  | threshold | 該当数 | 実績 | 1日あたり |
+  |---|---|---|---|
+  | 0.90 | 12,024 | 92.41% | 46.25 |
+  | 0.88 | 15,481 | 91.66% | 59.54 |
+  | 0.86 | 18,902 | 91.10% | 72.70 |
+  | **0.84** | **22,303** | **90.36%** | **85.78** |
+  | 0.82 | 25,315 | 89.65% | 97.37 |
+  | 0.80 | 28,194 | 88.91% | 108.44 |
+  | 0.78〜0.70 | 30,725〜37,745 | 88.19%〜85.71% | 118.17〜145.17 |
+
+  - **実績が90%を下回る境界: 閾値0.84(90.36%、まだ90%以上)と0.82(89.65%、
+    90%未満)の間**。
+  - **90%を保ったまま該当数を最大化する閾値: 0.84**（該当数22,303、
+    実績90.36%、1日あたり85.78艇）。
+  - **現行A(22,428件・90.37%・1日約86艇)とほぼ同じ水準**で、
+    B@0.84は該当数22,303件・1日85.78艇とわずかに少ない（-125件、
+    -0.48艇/日）。**「Bに切り替えれば同じ90%保証でAより多くの艇数が
+    取れる」という期待は支持されなかった**。B=0.84とA=0.96という
+    全く異なる数値で同じ約90%・同じ約86艇/日という結果に収束する点が
+    示唆的で、2つのモデルの確率スケールは違えど「90%保証で選べる艇の
+    実質的な上限」は現行Aのアプローチでほぼ天井に達している可能性がある。
+
+### Bの本番組み込み検討: 該当数を揃えた厳密比較とキャリブレーション（2026-10-04）
+- `uv run python -m ml.models.top3 --deep-dive`で2点を検証した。
+
+**1. 該当数を揃えた厳密比較**（同じ件数になる閾値同士で実績を比較）:
+
+  | 揃えた件数 | A実績 | B実績 | 差分(B-A) |
+  |---|---|---|---|
+  | 22,428件(A=0.96相当) | 90.37% | 90.32%(閾値0.8393) | -0.05pt |
+  | 13,212件(A=0.98相当) | 92.46% | 92.20%(閾値0.8935) | -0.26pt |
+  | 30,670件(A=0.92相当) | 87.54% | 88.21%(閾値0.7805) | +0.66pt |
+  | 33,179件(A=0.90相当) | 86.69% | 87.41%(閾値0.7579) | +0.72pt |
+
+  **confident_top3が実際に使う90%保証ライン付近(22,428件/13,212件)では
+  件数を揃えるとAとBの差はほぼ無い（-0.05pt/-0.26pt、Bがむしろ僅かに
+  劣る場合もある）**。Bの優位は件数が多い・閾値が低い領域(30,670件/
+  33,179件)でのみ+0.66〜+0.72ptと明確に出る。confident_top3の運用範囲
+  だけを見るなら「件数を揃えれば差がない」という事前の懸念は**部分的に
+  正しい**（90%保証ラインでは差がない。ただしもっと緩い基準では差が出る）。
+
+**2. キャリブレーション（10分位、has_result_rowが真の全艇対象）**:
+
+  | | A最大のズレ | B最大のズレ |
+  |---|---|---|
+  | 低確率帯(5%付近) | **+9.60pt**(bin2) | -0.83pt(bin1) |
+  | 高確率帯(83〜96%帯) | **-13.23pt**(bin9) | +1.14pt(bin9) |
+  | 全10bin | -13.23pt〜+9.60pt | -1.13pt〜+1.14pt |
+
+  Aの値は「p_top3の精度検証（2026-09-21）」で記録済みの値
+  (+9.6pt/-13.2pt)とほぼ完全に再現し、既存の知見と整合する。
+  **Bは全binで±1.14pt以内に収まっており、Aの最大13pt超のズレと比べて
+  桁違いに正直な確率を出している**。「低確率帯で弱気・高確率帯で強気」
+  というAの系統的なバイアスが、Bでは実質的に解消されている。
+
+- **結論（今回の2点を踏まえた判断材料）**: confident_top3の90%保証ライン
+  単体で見ればA→Bの切替メリットは乏しい（件数も精度もほぼ同等）。
+  一方、**確率の精度（キャリブレーション）は圧倒的にBが優れており**、
+  「的中率と回収率は必ず並記する」等、確率の意味そのものを製品的に使う
+  場面（グレード分けの閾値設計、別の確率帯での新機能、ユーザーへの
+  確率表示等）では、Aの±13pt級のバイアスを前提にした補正なしにそのまま
+  使うのは危険。Bの方がそうした用途に素直に使える。
+  判断はユーザー側で行う（本番組み込みはまだ行っていない）。
+- 残課題: Bの推論時v5欠損耐性は未検証（v5実験と同様の問題が起きないか
+  要確認。ただしBはv1+v2+v3のみで学習しているため今回は無関係）。
+  B正規化後の[0,1]超え(0.54%)をどう扱うか（単純clip等)も実装時に決める
+  必要がある。
+
+## 本番モデルを2本立て構成に変更（2026-10-04）
+- 上記の検証を踏まえ、Bを「3着以内予測専用モデル」として本番に組み込んだ。
+  1着予測モデル(is_winner)はそのまま残し、confident_top3(軸艇)だけを
+  3着以内予測モデル(is_top3)に切り替える**2モデル構成**にした。
+
+### モデル学習・保存（`ml/src/ml/models/train.py`）
+- `MODEL_KINDS`で`winner`(is_winner, prefix=v3_binary)と`top3`(is_top3,
+  prefix=v3_top3)を定義。デフォルト`--kind both`で1回のコマンドで両方を
+  学習・保存する（特徴量・学習期間・パラメータは完全に同じ、目的変数と
+  学習関数(`lgbm.train_model` / `top3.train_top3_model`)だけが違う）。
+  `uv run python -m ml.models.train`で
+  `v3_binary_20261004.pkl`/`v3_top3_20261004.pkl`を保存済み。
+
+### 推論（`ml/src/ml/models/predict.py`）
+- CLI引数を`predict.py <winner_model_version> <top3_model_version> <date>`
+  に変更。レースごとに**predictionsを2行**書く:
+  - winner_model_versionの行: p_firstのみ。p_top2/p_top3はNULL（既存のまま）。
+  - top3_model_versionの行: p_top3のみ。p_first/p_top2はNULL。
+  - p_top2は恒久的にNULL（Plackett-Luce由来の値を残すと「どちらのモデルの
+    定義か」が混在するため廃止）。
+  - 既存(race_id, model_version, stage)の存在チェックはモデルごとに独立に
+    行うため、片方だけ欠けている状態からの再実行でも安全に埋められる。
+  - top3モデルの正規化後[0,1]超え値は`ml.models.top3.predict_race_sum3_for_inference`
+    で単純に`clip(0,1)`し、clip件数を標準出力に出す
+    (`ml/src/ml/models/top3.py`に実装、研究用の`predict_race_sum3`とは別関数。
+    検証期間一括生成では244,152件中1,318件=0.54%でclipが発生、事前の
+    研究結果(1,323件)とほぼ一致)。
+- `judge.py`に実装漏れのバグ対策を追加: p_firstが全NULLのtop3専用行に対して
+  「ORDER BY p_first DESC LIMIT 1」を素朴に実行すると、NULL同士の順序は
+  不定で任意のlaneを「的中/不的中」と誤判定してしまうため、p_firstが
+  1件でも入っている行だけを対象にするEXISTS条件を追加した。
+
+### PHP側
+- `config/ml.php`: `prediction_top3_model_version`(env
+  `PREDICTION_TOP3_MODEL_VERSION`)を新設。`top3_confident_threshold`を
+  **0.96→0.84**に変更（根拠: 新モデルの検証期間実データで、本番API定義
+  (レースごとにp_top3最大の1艇)のまま0.70〜0.90を0.02刻みでスイープし、
+  実績90%を保ったまま該当数を最大化する境界が0.84(22,303件・90.36%)
+  だったため。0.82では89.65%で90%を下回る）。
+  `top3_confident_threshold_options`を`[0.96,0.97,0.98,0.99]`→
+  `[0.80,0.84,0.88,0.92,0.96]`に変更（新モデルの確率スケールに合わせた）。
+- `app/Models/Race.php`: `top3Prediction()`(HasOne、
+  `prediction_top3_model_version`に絞る)を追加。既存の`prediction()`は
+  1着予測モデルのまま変更なし。
+- `app/Http/Controllers/Api/RaceController.php`:
+  `top3Prediction.entries`を`today()`/`show()`両方でeager load。
+- `app/Http/Resources/RaceSummaryResource.php` /
+  `RaceDetailResource.php`: p_top3は`$this->top3Prediction`から取得する
+  よう変更（p_firstは従来通り`$this->prediction`から）。
+- `app/Http/Controllers/Api/PerformanceController.php::confidentTop3()`:
+  使う`model_version`を`prediction_model_version`→
+  `prediction_top3_model_version`に変更（SQL自体は無修正、パラメータの
+  差し替えのみ）。
+- `app/Console/Commands/PredictionsGenerateToday.php`: `--top3-model-version`
+  オプションを追加し、`ml.models.predict`に2つのmodel_versionを渡すよう
+  変更。`tickets:generate-today`はp_firstしか使わないため無変更
+  （1着予測モデルのmodel_versionのみ渡す）。
+- `.env`/`.env.example`: `PREDICTION_MODEL_VERSION`を
+  `v3_binary_20260920`→`v3_binary_20261004`に、
+  `PREDICTION_TOP3_MODEL_VERSION=v3_top3_20261004`を新設。
+
+### フロントエンド
+- `resources/js/pages/RacesToday.vue`: 「3着以内に入る確率が96%以上の艇。
+  検証期間で実績90.4%（22,429艇中20,270艇的中）」→「84%以上...
+  （22,303艇中20,154艇的中）」に変更。
+- `resources/js/pages/Performance.vue`: 閾値セレクタのデフォルト・
+  フォールバック候補を`0.96`/`[0.96,0.97,0.98,0.99]`→`0.84`/
+  `[0.80,0.84,0.88,0.92,0.96]`に変更。
+
+### 検証・実行結果
+- 検証期間(2026-01-01〜09-17、40,692レース)を新モデルで一括生成→
+  `predictions:judge`相当(`ml.models.judge`)を実行。winner/top3とも
+  races=40,500(+既存テスト分192=40,692)で欠落なし。judge結果:
+  judged=40,023 hit=22,755 hit_rate=56.85%（研究時の推定56.20〜56.69%と
+  整合）。本番API実測: confident_top3 該当22,309件・的中20,160件・
+  実績90.37%（研究時の推定22,303件・90.36%とほぼ一致、6件の差は
+  clip処理の違いによるものと考えられる）。
+- 旧モデル(v3_binary_20260919/20260920)のpredictions/tickets/judgmentsは
+  model_version違いでそのまま残置（上書きなし）。
+- 当日分(2026-10-04)も`races:fetch-today`→`predictions:generate-today`で
+  新モデルから作り直し済み（156レース、winner/top3とも936 entries、
+  tickets 1,232件生成）。
+- 残課題だった`DataCoverage`のtop3欠損検知漏れは2026-10-04に対応済み
+  （下記「DataCoverageのtop3モデル欠損検知」参照）。
+
+## DataCoverageのtop3モデル欠損検知（2026-10-04）
+- `has_predictions`がwinner model_versionの存在しか見ておらず、
+  top3モデル側だけ欠けていても「揃っている」と誤判定する問題を修正した。
+- `data_coverage`に`has_top3_predictions`列を追加
+  （migration: `2026_10_04_100001_add_has_top3_predictions_to_data_coverage_table.php`）。
+  1フラグに統合せず**別カラムに分離**した（results/payoutsと同じ方針。
+  どちらが欠けているか区別できる方が運用上有用なため）。
+  `DataCoverage::refreshCoverage()`は`$modelVersion`(winner)と
+  `$top3ModelVersion`(top3)を両方受け取り、それぞれ独立に
+  `races.n_races`との一致を見て`has_predictions`/`has_top3_predictions`を
+  算出する。
+- `missingFieldsFor()`/`criticalGapsFor()`に`top3_predictions`を追加
+  （`criticalGapsFor`の当日判定にも`top3_predictions`を含めた。
+  `data:catch-up:status`は`criticalGapsFor()`を汎用的に使っているため
+  無修正で自動的に反映される）。
+- `DataCatchUp.php`: `config('ml.prediction_top3_model_version')`を
+  追加で読み、`refreshCoverage()`の全呼び出しに渡すよう変更。
+  `fillDate()`の再生成トリガーを「predictionsまたはtop3_predictionsの
+  どちらかが欠けていれば`predictions:generate-today`を実行」に変更
+  （`predictions:generate-today`は(race_id, model_version, stage)単位で
+  既存分をスキップするため、片方だけ欠けている状態からの再実行でも
+  無駄なく埋まる）。日次・月次のレポート文言にも`top3_predictions`を反映。
+- **直近30日の突き合わせ結果（2026-09-05〜10-04）**: winner/top3の
+  predictions件数を日付ごとに直接比較したところ、**両モデルの件数は
+  全日程で完全に一致**し、片方だけ欠けている検知漏れは見つからなかった
+  （どの日も「両方0件」または「両方races件数と一致」のいずれか）。
+  一方、2026-09-18〜10-03の16日間はwinner/top3とも0件（完全な未生成）
+  だった。これは今回の2モデル化固有の問題ではなく、このセッションでは
+  `data:catch-up`相当の日次バッチが実際のcron/systemdスケジュールで
+  継続実行されておらず、対話的に生成した日付（検証期間の2026-01-01〜
+  09-17と当日2026-10-04）以外が単純に未処理だったため。本番でcron/systemd
+  が正常稼働していれば発生しない種類のギャップであり、`has_top3_predictions`
+  追加前から存在した一般的な運用ギャップ（新しい検知漏れではない）。
+  この16日分のpredictions生成は今回のタスク範囲外のため実施していない
+  （ユーザー判断待ち）。
+
+## 中止レースを考慮したhas_results/has_payoutsの修正（2026-10-06）
+- `has_results`/`has_payouts`は「その日の全レース数と一致して初めてtrue」と
+  定義していたため、荒天等で一部レースが中止になった日は、races行自体は
+  B(番組表)時点で作られているのに結果が永久に来ないため、`data:catch-up`が
+  いつまでも「欠損あり」と報告し続ける問題があった（2026-09-21: 戸田・
+  江戸川が全12R中止、津5〜12R中止、三国10〜12R中止。2026-09-22: 津が全12R
+  中止。Kファイルの[払戻金]概況表に「5R　中止」という形で明記されている）。
+- 対応案は2つ検討した: 1) `races`に`cancelled`フラグを追加しKファイルの
+  「中止」表記から機械的に判定、2) 一定期間(例:3日)結果が来ないレースを
+  推定で「中止扱い」にする。**1を採用**（2が正確性に欠けるため。単なる
+  配信遅延と中止の区別がKファイル自体に明記されているのに、タイムアウトで
+  推測するのは不要かつ不正確）。
+- 実装:
+  - `races`に`cancelled`(boolean, default false)列を追加
+    （migration: `2026_10_06_100001_add_cancelled_to_races_table.php`）。
+  - `ml/src/ml/parsers/result.py`: 中止レースは着順ブロック(NR形式の見出し+
+    着順6行)自体が存在せず、場ヘッダ内の[払戻金]概況表（全レースを一覧
+    表示する自由形式の表。開催日の行から最初の実レース見出しの直前までに
+    必ず1回だけ現れる）に「5R　中止」の形でのみ記録される。この区間を
+    スキャンする既存ループ（元々は「全レース中止で0件のまま次の場へ」の
+    判定にのみ使っていた）に正規表現`_CANCELLED_RACE_RE`での検出を追加し、
+    `ParsedResult.cancelled`（stadium_code/race_date/race_noのリスト）として
+    返すよう変更。全面中止・一部中止のどちらも同じループ1箇所の変更で
+    両対応できた（概況表は中止/開催済みを問わず全レース分が同じ1箇所に
+    まとまって出るため）。
+  - `ml/src/ml/loaders/results.py`に`mark_cancelled_races()`を追加。
+    対応する`races`行が無ければ`LoaderError`を送出する（race_results/
+    payoutsと同じ「黙って捨てない」方針）。一度中止と確定したレースが
+    後から取り消されることはない（Kファイルは確定後の最終結果）ため、
+    falseへの書き戻しは行わない。`ml/src/ml/loaders/cli.py`の
+    `load-results`、`ml/src/ml/loaders/backfill.py`の全期間バックフィル
+    両方の経路に組み込み済み。
+  - `app/Models/DataCoverage::refreshCoverage()`: `race_counts`に
+    `n_completable_races`(cancelled=falseの件数)を追加し、has_results/
+    has_payoutsの分母をこちらに変更。has_predictions/has_top3_predictions
+    は従来通り`n_races`(全件)のまま据え置き（中止は結果確定後にしか
+    判明せず、予測自体は締切前に正常に生成されているはずなので分母から
+    除外する理由がない）。
+- 検証: `ml/tests/test_result_parser.py`にbackfill時キャッシュ済みの実
+  ファイル(K260921.TXT=全面+一部中止混在、K260922.TXT=単一場全面中止)を
+  使った回帰テストを追加（中止レースの集合が一致すること、中止レースが
+  results/payoutsのどちらにも現れないこと等、4件）。ml側テスト全59件
+  パス。`data:catch-up --days=20`を再実行し、2026-09-21(cancelled=35件)・
+  2026-09-22(cancelled=12件、どちらも手動で数えた件数と一致)で
+  has_results/has_payoutsが実際にtrueへ反転したことを確認済み。
+- 2026-09-19は別種の理由で`has_payouts=false`のまま残っていた（下記
+  「2026-09-19の不成立レースとhas_payoutsの修正」で解消済み）。
+
+## 2026-09-19の不成立レースとhas_payoutsの修正（2026-10-06）
+- 上記の中止レース対応とは別に、2026-09-19は戸田9Rが「不成立」
+  （複数フライング等でレース自体が成立しなかった扱い。`_VALID_STATUSES`の
+  "00"相当）で、3連単・3連複は不成立で払戻自体が存在しない一方、2連単のみ
+  「1-2  100円」という払戻が実在するという混在ケースがあり、
+  `has_payouts=false`のまま残っていた。中止(races.cancelled)とは別の現象
+  （レース自体は行われている。race_resultsは6艇分とも正常に存在する）。
+- `data:catch-up:status`（前日・当日のみをstrictに見るヘルスチェック）は
+  2026-09-19のような過去日を通常は見ないため直接の影響はなかった
+  （実際に`php artisan data:catch-up:status`を実行し`OK`を確認済み）。
+  ただし同種の「一部式別のみ不成立」が将来別の日に起きた場合、その日が
+  「前日」に該当するタイミングで一時的にNGを出し続けることになり、
+  監視の信頼性を損なうため、恒久的な対処を行った。
+- 対応案は2つ検討した: 1) `payout_counts`の判定を「3連単の払戻が存在する」
+  から「いずれかの式別の払戻が存在する」に変える、2) 「不成立」をracesに
+  記録する別フラグを追加（中止フラグと同様の構成）。**発生頻度が低い
+  （観測1件のみ）ため1を採用**。`has_payouts`の実際の用途は「払戻データの
+  投入自体ができたか」の監視であり（`payout_counts`自体を式別ごとの
+  回収率計算等に使っている箇所は無いことをgrepで確認済み）、式別を問わず
+  1件でも払戻が存在すればデータ投入は成功しているとみなしてよいため、
+  2のような専用フラグ・パーサ改修は過剰と判断した。
+- `app/Models/DataCoverage::refreshCoverage()`の`payout_counts`CTEから
+  `AND po.bet_type = '3連単'`条件を削除し、レースに対して任意の式別の
+  payout行が1件でも存在すれば`has_payouts`の分子としてカウントするよう
+  変更。マイグレーション・パーサ変更は不要（SQLの条件変更のみ）。
+- 検証: 2026-09-19を`refreshCoverage()`で再計算し、`has_payouts`が
+  false→trueに反転したことを確認。2026-09-15〜10-05の全日程で
+  races/results/payouts/predictions/top3_predictionsが揃っていることを
+  再確認済み（10-06当日のみresults/payouts=false、結果未確定のため正常）。
+  `data:catch-up:status`は引き続き`OK`。
+
+## stage2構成（直前再予測、v5_exhibitionを含む）の導入（2026-10-08）
+- v5モデル(v5_binary_20261008/v5_top3_20261008)の学習・保存・再現確認が
+  完了したことを受け、本番に2段階予測構成（stage1=v3、stage2=v5）を導入した。
+  以下は設計・判断の根拠の記録。実データでの稼働結果（明日以降の初回稼働分）は
+  別途追記する。
+
+### 1. なぜ2段構成が必要だったか
+- beforeinfo(直前情報)は各レース締切のT-14〜16分に公開される
+  （CLAUDE.md「直前情報(beforeinfo)の取得」参照）。一方、本番の予測バッチ
+  (`predictions:generate-today`)は06:10に当日分をまとめて実行するため、
+  06:10時点ではその日の大半のレースの締切はまだ何時間も先であり、
+  v5_exhibition特徴量は存在しない。
+- 「v5モデルの推論時欠損耐性の検証」（2026-10-03）で実測済みの通り、
+  v5を含むモデルに対して推論時だけv5特徴量を全NaNにすると、的中率が
+  56.69%→31.07%、confident_top3が23,115件・90.50%→133件・47.37%まで
+  崩壊する。06:10の一括バッチでv5モデルをそのまま使うと、この最悪
+  ケースがほぼ毎日そのまま現実化する構成になってしまう。
+- `predictions.stage`は最初からこの用途を想定して設計されていた
+  （`database/migrations/2026_09_19_100004_create_predictions_tables.php`
+  のコメント「stage=1/2は将来の『締切前の早い段階の予測』『締切直前の
+  最終予測』等の2段階publishを想定した区分」、`CHECK (stage IN (1, 2))`、
+  `unique(race_id, model_version, stage)`）。stage2はこの既存設計を
+  初めて実際に使う形になった。
+
+### 2. ライブ取得の再開判断
+- 財団(一般財団法人BOATRACE振興会)への利用許諾確認は2026-09-21に
+  問い合わせて以降、回答が無いまま2026-10-08に至った。回答を待たず
+  ユーザー判断で`beforeinfo:schedule-today`のスケジュール登録を再開した
+  （backfill実行時と同じ、ユーザーがリスクを受容する形の判断）。
+- 負荷の見積り: ライブ取得は1レースにつき1リクエスト、1日最大288
+  リクエスト（0.003 req/s相当）。既に実施した全期間backfill（0.39 req/s
+  を約120時間）と比べて2桁軽い負荷であり、サイト運営への影響という
+  観点では既存の実績の範囲内に収まる。
+
+### 3. 捕捉タイミングT-12分の根拠（T-15分への変更は却下）
+- 前回の調査時点でいったんT-15分への変更を検討したが、却下した。
+  beforeinfoの公開はT-14〜16分の幅があり、T-15分で捕捉しようとすると
+  公開のタイミングによっては「データがありません」として失敗する確率が
+  T-12分より上がる（公開前に当たりうる）。
+- T-12分なら、最も遅い公開(T-14分)でも既に2分前に公開済みであることが
+  保証され、かつcutoff_at(=締切10分前)まで2分の余裕を持ってリーク検証
+  (`captured_at <= cutoff_at`)を満たせる。既存の`ScheduleBeforeInfoCapture`
+  の実装（`subMinutes(12)`固定）はそのまま維持した。
+
+### 4. 毎分バッチの設計（事前チェック・--race-ids・withoutOverlapping）
+- `predictions:generate-stage2`は当初、対象レースの有無に関わらず無条件で
+  `uv run`を3回（`ml.features.exhibition`/`ml.models.predict`/
+  `ml.models.tickets`）起動していた。実測したところ、該当レースが0件でも
+  実時間で約0.8秒・CPU時間で約5.3秒を消費する（主にLightGBMモデルの
+  ロード）。毎分×1日1440回この無駄打ちが積み重なるため、対象レースの
+  事前チェックを追加した。
+  - `PredictionsGenerateStage2::findEligibleRaceIds()`で「live
+    beforeinfoが揃っており(`race_before_info.source='live'`の件数が
+    `race_entries`件数と一致)・cutoff_at前(`deadline_at - 10分 > now()`)・
+    stage2未生成(winner/top3のどちらかが未生成)」を1クエリで判定し、
+    0件ならuv runを一切呼ばず即終了する。実測で0.8秒→0.094秒に短縮。
+  - `ml.features.exhibition`に`--race-ids`を追加した。以前は「今日1日分」
+    を毎回まるごとupsertする設計だったため、ライブ捕捉が進むにつれて
+    対象行が増え続け、夕方には捕捉済み全レース分（最大288レース×6艇=
+    1,728行/分）を毎分upsertし続けることになる計算だった。事前チェックで
+    特定したrace_idリストだけを渡すことで、この増加を防いだ。日付範囲
+    指定のみの既存呼び出し（バックフィル・過去分の一括生成）は無変更。
+  - `routes/console.php`の`predictions:generate-stage2`に
+    `withoutOverlapping(10)`を追加した。1回の処理が60秒を超えて次回の
+    起動と重なると、同じレースを並行処理してpredictions存在チェックが
+    競合する恐れがあるため。expiresAt=10分はプロセス異常終了時にロックが
+    残り続けないための安全弁（通常の処理は事前チェックのおかげで数秒〜
+    瞬時に終わる想定）。cache driverは`database`（`cache_locks`テーブル
+    による原子的ロックに対応していることを確認済み）。
+  - `ml.models.predict`自体（推論本体）はrace_id絞り込みをしていない
+    （「今日1日分、cutoff_at前のみ」のまま）。固定コストがLightGBMモデルの
+    ロードであり走査行数にほぼ依存しないため、ここを絞る効果は薄いと
+    判断した。
+
+### 5. stage優先ルールと二重計上の罠
+- 「レースごとにstage2の予測があればそれ、無ければstage1」という優先
+  ルールを、`Race::effectivePrediction()`/`effectiveTop3Prediction()`を
+  唯一の参照経路として全API・全集計で統一した（`RaceSummaryResource`/
+  `RaceDetailResource`/`PerformanceController`）。
+- **罠**: `predictions:judge`はstage1/stage2を独立に判定するため、
+  stage2の予測が存在するレースは`prediction_judgments`に2行
+  （stage1分のprediction_idに対する行とstage2分のprediction_idに対する
+  行）入る。`PerformanceController`の集計SQLで素朴に
+  `WHERE p.model_version IN (stage1版, stage2版) AND p.stage IN (1, 2)`
+  と絞ると、この2行が両方ヒットして同一レースが二重計上される
+  （的中数・レース数・買い目点数・回収額の全てが水増しされる）。
+  - 対策として、必ず`SELECT DISTINCT ON (race_id) id, race_id FROM
+    predictions WHERE model_version IN (?, ?) AND stage IN (1, 2)
+    ORDER BY race_id, stage DESC`という形のCTE（`active_winner`/
+    `active_top3`）を経由し、レースごとに1つのprediction_idへ絞ってから
+    `prediction_judgments`/`prediction_tickets`をJOINすること。
+    `model_version`に渡す2値のうちstage2側がnull（未設定環境）でも、
+    `model_version = NULL`は何にも一致しないため安全にstage1のみの
+    挙動にフォールバックする。
+  - **この罠は、将来この集計SQLに手を加える人が最も踏みやすいポイント
+    なので、新しい集計クエリを追加する際は必ず`active_winner`/
+    `active_top3`と同じCTEパターンを経由すること。**
+
+### 6. 閾値0.84を据え置いた根拠
+- v5_top3の閾値スイープ（0.80〜0.88を0.01刻み、本番API定義）:
+
+  | threshold | 該当数 | 実績 | マージン(実績-90%) | 1日あたり |
+  |---|---|---|---|---|
+  | 0.88 | 16,022 | 92.24% | +2.24pt | 61.62 |
+  | 0.87 | 17,747 | 91.90% | +1.90pt | 68.26 |
+  | 0.86 | 19,400 | 91.51% | +1.51pt | 74.62 |
+  | 0.85 | 21,046 | 91.20% | +1.20pt | 80.95 |
+  | **0.84** | **22,646** | **90.78%** | **+0.78pt** | **87.10** |
+  | 0.83 | 24,197 | 90.31% | +0.31pt | 93.07 |
+  | 0.82 | 25,751 | 90.04% | +0.04pt | 99.04 |
+  | 0.81 | 27,285 | 89.64% | -0.36pt | 104.94 |
+  | 0.80 | 28,685 | 89.30% | -0.70pt | 110.33 |
+
+  0.83(24,197件・90.31%)の方が該当数は多いが、90%までのマージンが
+  0.31ptしかなく、月次変動で容易に割り込みうる。0.84のv3側マージン
+  (0.36pt)より薄くなるため採用しなかった。
+- **0.84を据え置く根拠**: v3=90.36%(22,303件)・v5=90.78%(22,646件)と
+  どちらが使われても90%保証が成立し、「84%以上、実績90.4%」という
+  画面文言（`RacesToday.vue`）の変更も不要になる。
+- **キャリブレーション**: v3top3の最大ズレは±1.14pt、v5top3は±1.48pt
+  （bin9: 予測78.13%に対し実績79.61%）で、**v5がわずかに悪化している**。
+  この点は良い面だけでなく正直に記録しておく。「v5_top3の本番組み込み
+  検討」（2026-10-04）で比較した「該当数を揃えた厳密比較」の結論
+  （90%保証ラインでは差がほぼ無い）と整合する結果であり、v5採用の
+  決め手は的中率・該当数のわずかな改善であって、キャリブレーションの
+  改善ではない。
+
+### 7. 運用上の既知の制約
+- PC電源off運用のため、stage2のカバレッジは恒久的に部分的になる
+  （稼働中の時間帯に締切が来たレースしかstage2化されない）。これは
+  不具合ではない。そのため`data_coverage`では`has_predictions`等と同じ
+  booleanフラグにはせず、`stage2_prediction_race_count`という整数
+  カウント（`odds_race_count`と同じ扱い）で記録する。
+  `DataCoverage::criticalGapsFor()`には含めておらず、
+  `data:catch-up:status`の判定には一切影響しない。
+- `CaptureBeforeInfoJob`は`tries=2`で、2回失敗すると`failed_jobs`に
+  静かに入るだけでアラートは出ない。捕捉できなかったレースはstage1の
+  ままとなり、ユーザーからは「このレースだけ直前情報反映バッジが
+  付かない」という形でしか見えない。
+- 日中に予測がstage1→stage2へ差し替わるため、軸艇(confident_top3)等が
+  朝の時点と変わる可能性がある。何も示さずに差し替わるのは不親切なため、
+  レース詳細(`RaceDetail.vue`)に`uses_before_info`に基づく注意書きを
+  表示している。
+- ブラウザでの目視確認は未実施（この環境にブラウザ自動操作ツール
+  （built-in browser/Claude in Chrome/computer-use のいずれも）が
+  無かったため）。`npm run build`の成功と、APIレスポンスの直接検証
+  （`uses_before_info`等、テンプレートが参照する全フィールド）により
+  代替した。
+
+### 8. 変更・新規ファイル一覧（2026-10-08）
+- 新規マイグレーション:
+  `database/migrations/2026_10_08_100001_add_stage2_prediction_race_count_to_data_coverage_table.php`
+- 新規コマンド: `app/Console/Commands/PredictionsGenerateStage2.php`
+- 新規Vueコンポーネント: `resources/js/components/BeforeInfoBadge.vue`
+- 新規モデルファイル: `ml/models/v5_binary_20261008.pkl` /
+  `ml/models/v5_top3_20261008.pkl`
+- 変更（Laravel側）:
+  `routes/console.php`（beforeinfo:schedule-today再開、
+  predictions:generate-stage2のeveryMinute+withoutOverlapping登録）、
+  `config/ml.php`（prediction_stage2_model_version等）、
+  `.env`/`.env.example`（PREDICTION_STAGE2_MODEL_VERSION等）、
+  `app/Console/Commands/TicketsGenerateToday.php`（--stage追加）、
+  `app/Console/Commands/DataCatchUp.php`（stage2_prediction_race_count
+  のレポート追加）、`app/Models/DataCoverage.php`
+  （stage2_prediction_race_count集計）、`app/Models/Race.php`
+  （stage2Prediction/stage2Top3Prediction/effectivePrediction/
+  effectiveTop3Prediction/usesBeforeInfo）、
+  `app/Http/Controllers/Api/RaceController.php`（stage2のeager load）、
+  `app/Http/Controllers/Api/PerformanceController.php`
+  （active_winner/active_top3 CTEへの全面書き換え）、
+  `app/Http/Resources/RaceSummaryResource.php` /
+  `RaceDetailResource.php`（effectivePrediction経由・uses_before_info追加）
+- 変更（ml側）: `ml/src/ml/models/train.py`（--feature-set追加、
+  MODEL_PREFIXES）、`ml/src/ml/models/predict.py`（feature_set自動判定、
+  --only-before-cutoff、v5 SQL）、`ml/src/ml/features/exhibition.py`
+  （--race-ids追加）
+- 変更（フロントエンド）: `resources/js/pages/RacesToday.vue` /
+  `RaceDetail.vue`（BeforeInfoBadge表示、直前情報反映の注意書き）
+
 ## v4_stadium 特徴量（2026-09-21）
 - 場の特性・選手の場適性を追加。`ml/src/ml/features/stadium.py`。
   1. 場×枠番の基礎統計（race_dateより厳密に前の全履歴、expanding window。

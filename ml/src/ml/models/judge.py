@@ -6,6 +6,14 @@ prediction_results（ticket_id が NOT NULL・主キーで prediction_tickets �
 必須FK）は「舟券(買い目)ごとの的中判定」専用のテーブルであり、買い目が
 未実装の現時点では使えない（対応する ticket_id が存在しない）。そのため
 予測単位の的中は新設した prediction_judgments に記録する。
+
+2026-10-04、1着予測モデルと3着以内予測モデルの2本立てに変更してから、
+predictions には top3モデル由来の行（p_firstが全艇NULL、p_top3だけ入って
+いる）も存在するようになった。p_firstが全NULLの行に対して
+「ORDER BY p_first DESC LIMIT 1」をそのまま実行すると、NULL同士の順序は
+不定なので任意のlaneを拾って「predicted_lane」として誤って判定してしまう
+（p_firstを一切予測していないのに的中/不的中が記録される）。
+p_firstが1件でも入っている行だけを対象にするガードを入れている。
 """
 
 from __future__ import annotations
@@ -42,6 +50,10 @@ _JUDGE_INSERT_SQL = """
     ) winner ON true
     WHERE NOT EXISTS (
         SELECT 1 FROM prediction_judgments pj WHERE pj.prediction_id = p.id
+    )
+    AND EXISTS (
+        SELECT 1 FROM prediction_entries pe4
+        WHERE pe4.prediction_id = p.id AND pe4.p_first IS NOT NULL
     )
     AND (
         SELECT count(*) FROM race_entries re2
