@@ -333,6 +333,56 @@ def train_model(
     )
 
 
+def train_model_with_early_stopping(
+    inner_train_df: pl.DataFrame,
+    inner_val_df: pl.DataFrame,
+    feature_columns: list[str],
+    *,
+    params: dict | None = None,
+    max_boost_round: int = 2000,
+    early_stopping_rounds: int = 50,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[lgb.Booster, int]:
+    """inner_val_df(binary_loglossを監視)でearly stoppingし、木の本数を
+    自動選択する。inner_val_dfは呼び出し側(walk_forward.py)が学習窓の末尾
+    から切り出した内部検証用データで、walk-forwardの検証fold(評価対象)とは
+    別物であり、ここでは一切参照しない前提（リークの境界は呼び出し側の責務）。
+
+    返り値は(inner_train_dfのみで学習したbooster, best_iteration)。
+    本番で使う最終モデルは、このbest_iterationを固定のnum_boost_roundとして
+    train_model()でtrain_df全体(inner_train_df+inner_val_df)を再学習する
+    こと（内部検証に使った分のデータを捨てないため。呼び出し側の責務）。
+    """
+    X_train, y_train = _to_xy(inner_train_df, feature_columns)
+    X_val, y_val = _to_xy(inner_val_df, feature_columns)
+    cat_idx = [feature_columns.index(c) for c in CATEGORICAL_FEATURES if c in feature_columns]
+
+    train_set = lgb.Dataset(
+        X_train,
+        label=y_train,
+        weight=sample_weight,
+        feature_name=feature_columns,
+        categorical_feature=cat_idx,
+        free_raw_data=False,
+    )
+    val_set = lgb.Dataset(
+        X_val,
+        label=y_val,
+        reference=train_set,
+        feature_name=feature_columns,
+        categorical_feature=cat_idx,
+        free_raw_data=False,
+    )
+    booster = lgb.train(
+        {**DEFAULT_PARAMS, **(params or {})},
+        train_set,
+        num_boost_round=max_boost_round,
+        valid_sets=[val_set],
+        callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)],
+    )
+    return booster, booster.best_iteration
+
+
 def predict_race_normalized(
     booster: lgb.Booster, df: pl.DataFrame, feature_columns: list[str]
 ) -> pl.DataFrame:

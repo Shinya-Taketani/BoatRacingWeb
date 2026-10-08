@@ -105,7 +105,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import date
+import random as _random
+from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
@@ -123,6 +124,7 @@ from ml.models.lgbm import (
     fetch_v5_dataset,
     predict_race_normalized,
     train_model,
+    train_model_with_early_stopping,
 )
 from ml.models.top3 import confident_top3_production, top3_from_plackett_luce
 
@@ -178,13 +180,16 @@ def _train_and_eval(
     *,
     num_boost_round: int,
     sample_weight: np.ndarray | None,
+    params: dict | None = None,
 ) -> dict:
-    """1回の学習・推論・評価をまとめた内部ヘルパー。run_fold/run_fold_weight_sweep
-    の両方から使う（weight sweepではtrain_df/val_dfのfetchを1回にまとめ、
-    この関数だけを候補ごとに繰り返し呼ぶ）。
+    """1回の学習・推論・評価をまとめた内部ヘルパー。run_fold/run_fold_weight_sweep/
+    run_random_searchから使う（候補ごとにtrain_df/val_dfのfetchを繰り返さない
+    ため、この関数だけを候補ごとに繰り返し呼ぶ）。paramsを渡すとDEFAULT_PARAMSを
+    上書きする(ハイパーパラメータ探索用。省略時はDEFAULT_PARAMSのみ＝従来通り)。
     """
     booster = train_model(
-        train_df, feature_columns, num_boost_round=num_boost_round, sample_weight=sample_weight
+        train_df, feature_columns, num_boost_round=num_boost_round,
+        sample_weight=sample_weight, params=params,
     )
     winner_result = predict_race_normalized(booster, val_df, feature_columns)
     metrics = evaluate(winner_result)
@@ -309,6 +314,105 @@ def run_fold_weight_sweep(
     return results
 
 
+# early stoppingの内部検証に割く学習窓末尾の日数。約3ヶ月(90日)とした。
+# fold1の学習窓が19ヶ月と最短のため、長すぎると学習データが大きく削られる。
+# 既存のwalk-forward検証窓自体が3ヶ月であり、長さを揃えることで
+# 1号艇勝率の月次変動(CLAUDE.md「lane1勝率の構造変化」参照)のような
+# 短期ノイズをある程度均せる最小限の長さとして妥当と判断した。
+DEFAULT_INNER_VAL_TAIL_DAYS = 90
+DEFAULT_EARLY_STOPPING_ROUNDS = 50
+DEFAULT_MAX_BOOST_ROUND = 2000
+
+
+def split_inner_validation(
+    train_df: pl.DataFrame, train_end: str, *, tail_days: int = DEFAULT_INNER_VAL_TAIL_DAYS
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """学習窓の末尾tail_days日を内部検証セットとして切り出す。
+
+    walk-forwardの検証fold(val_start..val_end、最終的な評価対象)とは
+    完全に別物で、ここでは一切参照しない。あくまで学習窓の中だけで完結する
+    「学習窓終端より前のデータで学習→学習窓終端に近い期間で検証」という
+    通常のearly stopping用splitであり、リークにはならない。
+    """
+    train_end_date = date.fromisoformat(train_end)
+    inner_val_start = train_end_date - timedelta(days=tail_days - 1)
+    inner_train_df = train_df.filter(pl.col("race_date") < inner_val_start)
+    inner_val_df = train_df.filter(pl.col("race_date") >= inner_val_start)
+    return inner_train_df, inner_val_df
+
+
+def run_fold_boosting_compare(
+    conn: psycopg.Connection,
+    fold_idx: int,
+    train_start: str,
+    train_end: str,
+    val_start: str,
+    val_end: str,
+    feature_columns: list[str],
+    fetch_fn,
+    *,
+    num_boost_round_fixed: int = DEFAULT_NUM_BOOST_ROUND,
+    early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
+    inner_val_tail_days: int = DEFAULT_INNER_VAL_TAIL_DAYS,
+    max_boost_round: int = DEFAULT_MAX_BOOST_ROUND,
+    params: dict | None = None,
+) -> tuple[FoldResult, FoldResult, int]:
+    """「num_boost_round固定」と「early stoppingで選んだ本数」を同じfoldで
+    比較する。early stopping側は、学習窓末尾(inner_val_df)で本数
+    (best_iteration)だけを決め、そのあとtrain_df全体(inner_train_df+
+    inner_val_df、内部検証に使った分も含む)で再学習する—内部検証用に
+    データを失わないため。
+
+    返り値は(固定本数のFoldResult, early stopping選定本数のFoldResult,
+    選ばれたbest_iteration)。
+    """
+    train_df = fetch_fn(conn, train_start, train_end)
+    val_df = fetch_fn(conn, val_start, val_end)
+    lane1_rate = dummy_lane1_hit_rate(val_df)
+    train_races = train_df.select(pl.col("race_id").n_unique()).item()
+    val_races = val_df.select(pl.col("race_id").n_unique()).item()
+
+    def _build(metrics: dict) -> FoldResult:
+        return FoldResult(
+            fold=fold_idx,
+            train_start=train_start,
+            train_end=train_end,
+            val_start=val_start,
+            val_end=val_end,
+            train_races=train_races,
+            val_races=val_races,
+            hit_rate=metrics["hit_rate"],
+            lane1_hit_rate=lane1_rate,
+            log_loss=metrics["log_loss"],
+            brier_score=metrics["brier_score"],
+            confident_count=metrics["confident_count"],
+            confident_hits=metrics["confident_hits"],
+            confident_accuracy=metrics["confident_accuracy"],
+        )
+
+    fixed_metrics = _train_and_eval(
+        train_df, val_df, feature_columns, num_boost_round=num_boost_round_fixed,
+        sample_weight=None, params=params,
+    )
+    fixed_result = _build(fixed_metrics)
+
+    inner_train_df, inner_val_df = split_inner_validation(
+        train_df, train_end, tail_days=inner_val_tail_days
+    )
+    _, best_iter = train_model_with_early_stopping(
+        inner_train_df, inner_val_df, feature_columns,
+        params=params, max_boost_round=max_boost_round,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    es_metrics = _train_and_eval(
+        train_df, val_df, feature_columns, num_boost_round=best_iter,
+        sample_weight=None, params=params,
+    )
+    es_result = _build(es_metrics)
+
+    return fixed_result, es_result, best_iter
+
+
 def run_walk_forward(
     conn: psycopg.Connection, feature_set: str, *, num_boost_round: int = DEFAULT_NUM_BOOST_ROUND
 ) -> list[FoldResult]:
@@ -321,6 +425,136 @@ def run_walk_forward(
         )
         results.append(r)
     return results
+
+
+# --- ハイパーパラメータのランダムサーチ(第2段階) --------------------------
+# num_boost_round(木の本数)は対象外: 第1段階(early stopping)の結論に従い
+# main()側で固定値またはfold別の値として渡す。ここで同時に探索すると
+# 「少ない本数+強い正則化」と「多い本数+弱い正則化」が区別できなくなり、
+# 解釈が難しくなるため。
+
+PARAM_SEARCH_RANGES = {
+    "num_leaves": (15, 255),  # int
+    "min_data_in_leaf": (10, 200),  # int
+    "feature_fraction": (0.5, 1.0),  # float, uniform
+    "bagging_fraction": (0.5, 1.0),  # float, uniform
+    "bagging_freq": (1, 10),  # int
+    "lambda_l1": (-4, 1),  # float, log10-uniform (10^-4 〜 10^1)
+    "lambda_l2": (-4, 1),  # float, log10-uniform
+    "learning_rate": (-2, -0.7),  # float, log10-uniform (約0.01〜0.2)
+}
+
+
+def sample_params(rng: _random.Random) -> dict:
+    return {
+        "num_leaves": rng.randint(*PARAM_SEARCH_RANGES["num_leaves"]),
+        "min_data_in_leaf": rng.randint(*PARAM_SEARCH_RANGES["min_data_in_leaf"]),
+        "feature_fraction": rng.uniform(*PARAM_SEARCH_RANGES["feature_fraction"]),
+        "bagging_fraction": rng.uniform(*PARAM_SEARCH_RANGES["bagging_fraction"]),
+        "bagging_freq": rng.randint(*PARAM_SEARCH_RANGES["bagging_freq"]),
+        "lambda_l1": 10 ** rng.uniform(*PARAM_SEARCH_RANGES["lambda_l1"]),
+        "lambda_l2": 10 ** rng.uniform(*PARAM_SEARCH_RANGES["lambda_l2"]),
+        "learning_rate": 10 ** rng.uniform(*PARAM_SEARCH_RANGES["learning_rate"]),
+    }
+
+
+def run_random_search(
+    conn: psycopg.Connection,
+    feature_set: str,
+    n_trials: int,
+    *,
+    boost_rounds: int | dict[int, int],
+    seed: int = 0,
+) -> list[dict]:
+    """n_trials個のパラメータをランダムサンプリングし、全6foldで評価する。
+    fold単位でtrain_df/val_dfを1回だけfetchし、同じfoldデータに対して
+    全試行を順に学習する（DBアクセスをn_trials倍にしない）。
+    boost_roundsは全fold共通のintか、fold番号->本数のdict
+    （第1段階でearly stoppingが有効だった場合、fold別のbest_iterationを
+    そのまま渡せる）。
+
+    返り値は各試行について
+    {"trial": int, "params": dict, "fold_results": list[FoldResult],
+     "mean_hit_rate": float} のリスト（サンプリング順）。
+    """
+    fetch_fn, feature_columns = FEATURE_SETS[feature_set]
+    rng = _random.Random(seed)
+    param_list = [sample_params(rng) for _ in range(n_trials)]
+
+    trial_fold_results: list[list[FoldResult]] = [[] for _ in range(n_trials)]
+
+    for i, (train_start, train_end, val_start, val_end) in enumerate(FOLDS, start=1):
+        train_df = fetch_fn(conn, train_start, train_end)
+        val_df = fetch_fn(conn, val_start, val_end)
+        lane1_rate = dummy_lane1_hit_rate(val_df)
+        train_races = train_df.select(pl.col("race_id").n_unique()).item()
+        val_races = val_df.select(pl.col("race_id").n_unique()).item()
+        nb = boost_rounds[i] if isinstance(boost_rounds, dict) else boost_rounds
+
+        for t, params in enumerate(param_list):
+            metrics = _train_and_eval(
+                train_df, val_df, feature_columns, num_boost_round=nb,
+                sample_weight=None, params=params,
+            )
+            trial_fold_results[t].append(
+                FoldResult(
+                    fold=i,
+                    train_start=train_start,
+                    train_end=train_end,
+                    val_start=val_start,
+                    val_end=val_end,
+                    train_races=train_races,
+                    val_races=val_races,
+                    hit_rate=metrics["hit_rate"],
+                    lane1_hit_rate=lane1_rate,
+                    log_loss=metrics["log_loss"],
+                    brier_score=metrics["brier_score"],
+                    confident_count=metrics["confident_count"],
+                    confident_hits=metrics["confident_hits"],
+                    confident_accuracy=metrics["confident_accuracy"],
+                )
+            )
+            print(
+                f"  [fold{i} trial{t}] hit_rate={metrics['hit_rate'] * 100:.2f}% "
+                f"log_loss={metrics['log_loss']:.4f}",
+                flush=True,
+            )
+
+    trials = []
+    for t, params in enumerate(param_list):
+        fold_results = trial_fold_results[t]
+        mean_hr = float(np.mean([r.hit_rate for r in fold_results]))
+        trials.append(
+            {"trial": t, "params": params, "fold_results": fold_results, "mean_hit_rate": mean_hr}
+        )
+    return trials
+
+
+def print_search_top_n(trials: list[dict], n: int = 5) -> None:
+    """mean_hit_rate降順で上位n件を表示する。多重比較の目安として、
+    最良が突出しているか団子状態かをここで目視できるようにする。
+    """
+    ranked = sorted(trials, key=lambda t: t["mean_hit_rate"], reverse=True)
+    print(f"\n=== ランダムサーチ 上位{n}件(平均的中率降順) ===")
+    print(f"{'順位':>4s} {'trial':>6s} {'平均的中率':>10s} {'主なパラメータ':<80s}")
+    for rank, t in enumerate(ranked[:n], start=1):
+        p = t["params"]
+        p_str = (
+            f"num_leaves={p['num_leaves']} min_data_in_leaf={p['min_data_in_leaf']} "
+            f"feature_fraction={p['feature_fraction']:.3f} bagging_fraction={p['bagging_fraction']:.3f} "
+            f"bagging_freq={p['bagging_freq']} lambda_l1={p['lambda_l1']:.4g} "
+            f"lambda_l2={p['lambda_l2']:.4g} learning_rate={p['learning_rate']:.4g}"
+        )
+        print(f"{rank:>4d} {t['trial']:>6d} {t['mean_hit_rate'] * 100:>9.2f}% {p_str}")
+
+    if len(ranked) >= 2:
+        gap = (ranked[0]["mean_hit_rate"] - ranked[1]["mean_hit_rate"]) * 100
+        spread = (ranked[0]["mean_hit_rate"] - ranked[min(n, len(ranked)) - 1]["mean_hit_rate"]) * 100
+        print(
+            f"\n1位と2位の差: {gap:+.3f}pt / 1位と{min(n, len(ranked))}位の差: {spread:+.3f}pt "
+            "(1位と2位以下が僅差=団子状態なら、1位は40試行から選んだ見かけの最大値に"
+            "過ぎず偶然の可能性が高い。はっきり突出していなければ採用に慎重になること)"
+        )
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -486,7 +720,142 @@ def main(argv: list[str] | None = None) -> int:
         default="exponential",
         help="時間減衰の形。--weight-sweep時のみ使用（デフォルトexponential）",
     )
+    parser.add_argument(
+        "--boosting-compare",
+        action="store_true",
+        help="num_boost_round固定とearly stoppingを比較する(--feature-setはv3/v5単体のみ)",
+    )
+    parser.add_argument(
+        "--early-stopping-rounds", type=int, default=DEFAULT_EARLY_STOPPING_ROUNDS,
+        help="--boosting-compare時のearly_stopping_rounds",
+    )
+    parser.add_argument(
+        "--inner-val-tail-days", type=int, default=DEFAULT_INNER_VAL_TAIL_DAYS,
+        help="--boosting-compare時、学習窓末尾何日を内部検証に使うか",
+    )
+    parser.add_argument(
+        "--random-search",
+        action="store_true",
+        help="ハイパーパラメータのランダムサーチを行う(--feature-setはv3/v5単体のみ)",
+    )
+    parser.add_argument(
+        "--n-trials", type=int, default=40, help="--random-search時の試行回数",
+    )
+    parser.add_argument(
+        "--search-seed", type=int, default=0, help="--random-search時の乱数シード",
+    )
+    parser.add_argument(
+        "--boost-rounds",
+        type=str,
+        default=None,
+        help="--random-search時のnum_boost_round。単一の整数、または"
+        "fold番号:本数をカンマ区切りで指定(例: 1:150,2:180,...)。"
+        "省略時は--num-boost-round(デフォルト200)を全fold共通で使う",
+    )
     args = parser.parse_args(argv)
+
+    if args.boosting_compare:
+        if args.feature_set == "both":
+            parser.error("--boosting-compare では --feature-set は v3 か v5 を指定してください(bothは不可)")
+
+        fixed_results: list[FoldResult] = []
+        es_results: list[FoldResult] = []
+        best_iters: list[int] = []
+
+        conn = get_connection()
+        try:
+            fetch_fn, feature_columns = FEATURE_SETS[args.feature_set]
+            for i, (train_start, train_end, val_start, val_end) in enumerate(FOLDS, start=1):
+                fixed_r, es_r, best_iter = run_fold_boosting_compare(
+                    conn, i, train_start, train_end, val_start, val_end, feature_columns, fetch_fn,
+                    num_boost_round_fixed=args.num_boost_round,
+                    early_stopping_rounds=args.early_stopping_rounds,
+                    inner_val_tail_days=args.inner_val_tail_days,
+                )
+                fixed_results.append(fixed_r)
+                es_results.append(es_r)
+                best_iters.append(best_iter)
+                print(f"  [fold{i}] best_iteration(early stopping)={best_iter} (固定={args.num_boost_round})")
+        finally:
+            conn.close()
+
+        print_fold_table(f"{args.feature_set}/固定{args.num_boost_round}本", fixed_results)
+        print_fold_table(f"{args.feature_set}/early_stopping(本数={best_iters})", es_results)
+        compare(
+            f"固定{args.num_boost_round}本", fixed_results,
+            "early_stopping", es_results, show_data_volume_note=False,
+        )
+        return 0
+
+    if args.random_search:
+        if args.feature_set == "both":
+            parser.error("--random-search では --feature-set は v3 か v5 を指定してください(bothは不可)")
+
+        if args.boost_rounds is None:
+            boost_rounds: int | dict[int, int] = args.num_boost_round
+        elif ":" in args.boost_rounds:
+            boost_rounds = {
+                int(part.split(":")[0]): int(part.split(":")[1])
+                for part in args.boost_rounds.split(",")
+            }
+        else:
+            boost_rounds = int(args.boost_rounds)
+
+        conn = get_connection()
+        try:
+            trials = run_random_search(
+                conn, args.feature_set, args.n_trials,
+                boost_rounds=boost_rounds, seed=args.search_seed,
+            )
+
+            # ベースライン(DEFAULT_PARAMS、同じboost_roundsポリシー)も同条件で評価する。
+            fetch_fn, feature_columns = FEATURE_SETS[args.feature_set]
+            baseline_results: list[FoldResult] = []
+            for i, (train_start, train_end, val_start, val_end) in enumerate(FOLDS, start=1):
+                train_df = fetch_fn(conn, train_start, train_end)
+                val_df = fetch_fn(conn, val_start, val_end)
+                lane1_rate = dummy_lane1_hit_rate(val_df)
+                nb = boost_rounds[i] if isinstance(boost_rounds, dict) else boost_rounds
+                metrics = _train_and_eval(
+                    train_df, val_df, feature_columns, num_boost_round=nb, sample_weight=None
+                )
+                baseline_results.append(
+                    FoldResult(
+                        fold=i, train_start=train_start, train_end=train_end,
+                        val_start=val_start, val_end=val_end,
+                        train_races=train_df.select(pl.col("race_id").n_unique()).item(),
+                        val_races=val_df.select(pl.col("race_id").n_unique()).item(),
+                        hit_rate=metrics["hit_rate"], lane1_hit_rate=lane1_rate,
+                        log_loss=metrics["log_loss"], brier_score=metrics["brier_score"],
+                        confident_count=metrics["confident_count"],
+                        confident_hits=metrics["confident_hits"],
+                        confident_accuracy=metrics["confident_accuracy"],
+                    )
+                )
+        finally:
+            conn.close()
+
+        print_fold_table(f"{args.feature_set}/DEFAULT_PARAMS(ベースライン)", baseline_results)
+        print_search_top_n(trials, n=5)
+
+        ranked = sorted(trials, key=lambda t: t["mean_hit_rate"], reverse=True)
+        best = ranked[0]
+        print(f"\n=== 最良候補(trial{best['trial']}) vs DEFAULT_PARAMSベースライン ===")
+        print(f"採用候補のパラメータ: {best['params']}")
+        print_fold_table(f"{args.feature_set}/best(trial{best['trial']})", best["fold_results"])
+        verdict = compare(
+            "baseline", baseline_results, "best_candidate", best["fold_results"],
+            show_data_volume_note=False,
+        )
+        print(
+            f"\n見かけの改善幅(40試行中の最良値、選択バイアスを含む): "
+            f"{(best['mean_hit_rate'] - float(np.mean([r.hit_rate for r in baseline_results]))) * 100:+.3f}pt"
+        )
+        print(
+            f"選択バイアスを考慮した判定(baseline比、全fold一貫 かつ 実験ごとの目安超え): "
+            f"{'有意' if verdict['significant'] else '誤差の範囲/不採用'}"
+        )
+        return 0
 
     if args.weight_sweep:
         if args.feature_set == "both":
