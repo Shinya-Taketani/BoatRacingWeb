@@ -89,11 +89,17 @@ def train_top3_model(
     *,
     params: dict | None = None,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
+    sample_weight: np.ndarray | None = None,
 ) -> lgb.Booster:
+    """sample_weight省略時(デフォルト)は重み無し＝従来と完全に同じ挙動。
+    lgbm.compute_time_decay_weights()で計算した配列をそのまま渡せる
+    （行順がtrain_dfと一致している前提）。
+    """
     X_train, y_train = _to_xy(train_df, feature_columns)
     train_set = lgb.Dataset(
         X_train,
         label=y_train,
+        weight=sample_weight,
         feature_name=feature_columns,
         categorical_feature=[
             feature_columns.index(c) for c in CATEGORICAL_FEATURES if c in feature_columns

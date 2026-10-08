@@ -134,7 +134,7 @@ _COMBINED_SELECT_SQL = """
 """
 
 _ALL_SELECT_SQL = """
-    SELECT f1.race_id, f1.lane, f1.payload AS payload_v1, f2.payload AS payload_v2,
+    SELECT f1.race_id, f1.lane, r.race_date, f1.payload AS payload_v1, f2.payload AS payload_v2,
            f3.payload AS payload_v3, rr.finish_pos, (rr.race_entry_id IS NOT NULL) AS has_result_row
     FROM features f1
     JOIN features f2
@@ -167,7 +167,7 @@ _V4_SELECT_SQL = """
 
 
 _V5_SELECT_SQL = """
-    SELECT f1.race_id, f1.lane, f1.payload AS payload_v1, f2.payload AS payload_v2,
+    SELECT f1.race_id, f1.lane, r.race_date, f1.payload AS payload_v1, f2.payload AS payload_v2,
            f3.payload AS payload_v3, f5.payload AS payload_v5, rr.finish_pos,
            (rr.race_entry_id IS NOT NULL) AS has_result_row
     FROM features f1
@@ -192,10 +192,11 @@ def fetch_v5_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
         rows = cur.fetchall()
 
     records = []
-    for race_id, lane, payload_v1, payload_v2, payload_v3, payload_v5, finish_pos, has_result_row in rows:
+    for race_id, lane, race_date, payload_v1, payload_v2, payload_v3, payload_v5, finish_pos, has_result_row in rows:
         record = {**payload_v1, **payload_v2, **payload_v3, **payload_v5}
         record["race_id"] = race_id
         record["lane"] = lane
+        record["race_date"] = race_date
         record["finish_pos"] = finish_pos
         record["is_winner"] = 1 if finish_pos == 1 else 0
         record["has_result_row"] = has_result_row
@@ -229,10 +230,11 @@ def fetch_all_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
         rows = cur.fetchall()
 
     records = []
-    for race_id, lane, payload_v1, payload_v2, payload_v3, finish_pos, has_result_row in rows:
+    for race_id, lane, race_date, payload_v1, payload_v2, payload_v3, finish_pos, has_result_row in rows:
         record = {**payload_v1, **payload_v2, **payload_v3}
         record["race_id"] = race_id
         record["lane"] = lane
+        record["race_date"] = race_date
         record["finish_pos"] = finish_pos
         record["is_winner"] = 1 if finish_pos == 1 else 0
         record["has_result_row"] = has_result_row
@@ -268,17 +270,58 @@ def _to_xy(df: pl.DataFrame, feature_columns: list[str]) -> tuple:
     return X, y
 
 
+def compute_time_decay_weights(
+    race_dates,
+    reference_date,
+    *,
+    decay: str = "exponential",
+    half_life_days: float,
+) -> np.ndarray:
+    """race_dateがreference_date(通常は学習窓の終端=train_end)に近いほど
+    重みが大きくなるサンプル重みを返す。
+
+    半減期(half_life_days)で3種類の減衰形を統一的にパラメータ化する:
+    - "exponential": weight = 2^(-age/half_life)。age=half_lifeで0.5、
+      age=2*half_lifeで0.25、と連続的に減衰する素直な定義。
+    - "linear": weight = max(0, 1 - age/(2*half_life))。age=half_lifeで
+      ちょうど0.5になるよう傾きを決め、age>=2*half_lifeで0に切り詰める
+      （exponentialと違い、ある時点より古いデータは完全に重み0になる）。
+    - "step": weight = 2^(-floor(age/half_life))。half_life周期ごとに
+      重みが0.5倍になる階段関数（exponentialの階段近似）。
+
+    age(日数)は (reference_date - race_date).days で、reference_dateより
+    未来の日付(本来無いはずだが防御的に)は age=0 にクリップする。
+    """
+    ages = np.array([(reference_date - d).days for d in race_dates], dtype=float)
+    ages = np.clip(ages, 0, None)
+
+    if decay == "exponential":
+        return np.power(2.0, -ages / half_life_days)
+    if decay == "linear":
+        return np.clip(1.0 - ages / (2.0 * half_life_days), 0.0, None)
+    if decay == "step":
+        return np.power(2.0, -np.floor(ages / half_life_days))
+    raise ValueError(f"decay must be one of 'exponential'/'linear'/'step', got {decay!r}")
+
+
 def train_model(
     train_df: pl.DataFrame,
     feature_columns: list[str],
     *,
     params: dict | None = None,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
+    sample_weight: np.ndarray | None = None,
 ) -> lgb.Booster:
+    """sample_weight省略時(デフォルト)は重み無し＝従来と完全に同じ挙動。
+    時間減衰重みを使う場合は compute_time_decay_weights() で計算した配列を
+    渡す（train_dfと行順が一致している前提。train_dfを並べ替えずそのまま
+    渡せば自動的に一致する）。
+    """
     X_train, y_train = _to_xy(train_df, feature_columns)
     train_set = lgb.Dataset(
         X_train,
         label=y_train,
+        weight=sample_weight,
         feature_name=feature_columns,
         categorical_feature=[
             feature_columns.index(c) for c in CATEGORICAL_FEATURES if c in feature_columns
