@@ -109,9 +109,21 @@ class DataCatchUp extends Command
         if ($coverage->has_races && (! $coverage->has_results || ! $coverage->has_payouts)) {
             $this->line("{$date}: race_results/payouts 欠損 -> ml load-results を実行");
 
+            // --force必須。fetch_and_extract()はdest_dirに展開済み.TXTが
+            // あれば問答無用でそれを使い回す（B/Kどちらも同じ挙動）。Kファイルは
+            // B(番組表)と違い、その日のレースが進行するにつれて逐次更新され
+            // 完全版になる。レース未終了時点でこの欠損補完が一度走って
+            // 不完全なKファイルをキャッシュしてしまうと、以後ここに来るたびに
+            // 同じ不完全な.TXTを読み直すだけでhas_results/has_payoutsが
+            // 永久にtrueにならない不具合が実際に発生した（2026-10-09分、
+            // 18時台に576/864行(96/144レース)で一度キャッシュされ、翌朝
+            // 起動時のdata:catch-upで再実行しても同じ576行のままだった。
+            // 2026-10-10発覚）。ここは「has_results/has_payoutsが欠損している
+            // 時だけ」呼ばれる経路なので、毎回force=trueにしても再ダウンロード
+            // されるのはこの数日分に限られ、コストは小さい。
             $result = Process::path(base_path('ml'))
                 ->timeout(120)
-                ->run([config('ml.uv_binary'), 'run', 'python', '-m', 'ml.loaders.cli', 'load-results', $date]);
+                ->run([config('ml.uv_binary'), 'run', 'python', '-m', 'ml.loaders.cli', 'load-results', $date, '--force']);
 
             foreach (explode("\n", trim($result->output())) as $line) {
                 if ($line !== '') {
