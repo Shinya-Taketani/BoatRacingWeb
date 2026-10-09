@@ -154,6 +154,151 @@ def predict_race_sum3_for_inference(
     return result.select(["race_id", "lane", "p_top3"]), clipped_count
 
 
+def solve_logit_shift(
+    logits: np.ndarray, target_sum: float = 3.0, *, tol: float = 1e-9, max_iter: int = 100
+) -> float:
+    """Σ sigmoid(logit_i + delta) = target_sum を満たすdeltaを二分探索で求める。
+
+    f(delta) = Σ sigmoid(logit_i+delta) はdeltaについて連続かつ狭義単調増加
+    （sigmoidの合成和）で、delta→-∞のとき0、delta→+∞のとき艇数(6)に
+    単調に収束する。target_sum=3.0は常にこの開区間(0,6)の内側にあるため、
+    6艇の予測値がどれほど極端（全艇が非常に高い/低い確率）であっても、
+    中間値の定理により解deltaは艇の値によらず必ず一意に存在する
+    （「解が存在しない場合」は数学的に起こらない。数値計算上、初期の
+    探索区間[-100,100]で収束しない極端なケースに備え、区間を自動的に
+    広げる防御だけ入れてある）。
+
+    これは1レース分を単独で解く参照実装（アルゴリズムの検証・単発利用に
+    使う）。大量のレースをまとめて処理する実運用パス(predict_race_logit_shift
+    等)は、Pythonループで本関数をレース毎に呼ぶと数万レース規模で著しく
+    遅いため、_logit_shift_p_top3()内に同じ二分探索をnumpyでベクトル化した
+    別実装を持つ（ロジックは本関数と同一、全レース分を同時に反復するだけ）。
+    """
+    def f(delta: float) -> float:
+        return float(np.sum(1.0 / (1.0 + np.exp(-(logits + delta))))) - target_sum
+
+    lo, hi = -100.0, 100.0
+    flo, fhi = f(lo), f(hi)
+    while flo > 0:
+        lo -= 100.0
+        flo = f(lo)
+    while fhi < 0:
+        hi += 100.0
+        fhi = f(hi)
+
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        fm = f(mid)
+        if abs(fm) < tol:
+            return mid
+        if fm > 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2.0
+
+
+def _logit_shift_p_top3(
+    race_ids: list, lanes: list[int], raw_logits: np.ndarray, *, boats_per_race: int = 6
+) -> dict[tuple, float]:
+    """(race_id, lane) -> ロジット平行移動後のp_top3 のマッピングを返す
+    内部ヘルパー。predict_race_logit_shift/_for_inference共通。
+
+    solve_logit_shift()をレースごとにPythonループで呼ぶと(1レースあたり
+    最大100回の反復×数万レースで)著しく遅いため、全レース分のdeltaを
+    numpyでまとめて二分探索するベクトル化版にしている
+    （入力はrace_id, lane昇順でboats_per_race行ごとに1レース、という
+    fetch_all_dataset等の既存の並び順の前提に依存する）。
+    """
+    n = len(race_ids)
+    if n % boats_per_race != 0:
+        raise ValueError(
+            f"race_idsの件数({n})がboats_per_race({boats_per_race})の倍数ではない"
+            "（1レースあたりの艇数がboats_per_raceと一致しない行が混ざっている）"
+        )
+    logits_2d = np.asarray(raw_logits, dtype=float).reshape(-1, boats_per_race)
+    n_races = logits_2d.shape[0]
+
+    lo = np.full(n_races, -100.0)
+    hi = np.full(n_races, 100.0)
+
+    def f(delta: np.ndarray) -> np.ndarray:
+        with np.errstate(over="ignore"):
+            return (1.0 / (1.0 + np.exp(-(logits_2d + delta[:, None])))).sum(axis=1) - 3.0
+
+    flo, fhi = f(lo), f(hi)
+    while np.any(flo > 0):
+        mask = flo > 0
+        lo[mask] -= 100.0
+        flo[mask] = f(lo)[mask]
+    while np.any(fhi < 0):
+        mask = fhi < 0
+        hi[mask] += 100.0
+        fhi[mask] = f(hi)[mask]
+
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        positive = f(mid) > 0
+        hi = np.where(positive, mid, hi)
+        lo = np.where(positive, lo, mid)
+    delta = (lo + hi) / 2.0
+
+    with np.errstate(over="ignore"):
+        probs = 1.0 / (1.0 + np.exp(-(logits_2d + delta[:, None])))
+
+    race_ids_per_race = race_ids[::boats_per_race]
+    p_top3_by_key: dict[tuple, float] = {}
+    for idx, race_id in enumerate(race_ids_per_race):
+        base = idx * boats_per_race
+        for b in range(boats_per_race):
+            p_top3_by_key[(race_id, lanes[base + b])] = float(probs[idx, b])
+    return p_top3_by_key
+
+
+def predict_race_logit_shift(
+    booster: lgb.Booster, df: pl.DataFrame, feature_columns: list[str]
+) -> pl.DataFrame:
+    """is_top3の素のロジット(raw_score)を、レース内合計3.0になるよう
+    全艇に同じdeltaを平行移動してからsigmoidに通す（predict_race_sum3の
+    線形スケーリング版との比較用）。sigmoidの値域は開区間(0,1)なので
+    clipが構造的に不要、かつ全艇に同じ単調変換(deltaの加算)を施すだけ
+    なのでレース内の艇の順位は厳密に保存される。
+    dfはrace_id, lane順にソート済みである前提（fetch_all_dataset等の
+    既存の取得関数はrace_id, lane昇順でORDER BYしており、この前提を満たす）。
+    """
+    X, _ = _to_xy(df, feature_columns)
+    raw_logit = booster.predict(X, raw_score=True)
+
+    base = df.select(
+        ["race_id", "lane", "finish_pos", "has_result_row", TARGET_COLUMN]
+    )
+    race_ids = base["race_id"].to_list()
+    lanes = base["lane"].to_list()
+    p_top3_by_key = _logit_shift_p_top3(race_ids, lanes, raw_logit)
+    p_top3_col = [p_top3_by_key[(r, l)] for r, l in zip(race_ids, lanes)]
+    return base.with_columns(pl.Series("p_top3", p_top3_col))
+
+
+def predict_race_logit_shift_for_inference(
+    booster: lgb.Booster, df: pl.DataFrame, feature_columns: list[str]
+) -> tuple[pl.DataFrame, int]:
+    """本番推論用。predict_race_sum3_for_inferenceと同じ呼び出し
+    インターフェース(race_id/lane/特徴量列だけでよい、戻り値は
+    (結果, clip件数)のタプル)を保つが、ロジット空間の平行移動は値域が
+    常に(0,1)に収まるためclipは構造的に発生せず、clipped_countは常に0。
+    """
+    X = df.select([pl.col(c).cast(pl.Float64) for c in feature_columns]).to_numpy()
+    raw_logit = booster.predict(X, raw_score=True)
+
+    base = df.select(["race_id", "lane"])
+    race_ids = base["race_id"].to_list()
+    lanes = base["lane"].to_list()
+    p_top3_by_key = _logit_shift_p_top3(race_ids, lanes, raw_logit)
+    p_top3_col = [p_top3_by_key[(r, l)] for r, l in zip(race_ids, lanes)]
+    result = base.with_columns(pl.Series("p_top3", p_top3_col))
+    return result, 0
+
+
 def top3_from_plackett_luce(winner_result: pl.DataFrame, val_df: pl.DataFrame) -> pl.DataFrame:
     """is_winnerモデルのpred_prob(p_first)からPlackett-Luce展開でp_top3を導出する。"""
     info_by_key = {
