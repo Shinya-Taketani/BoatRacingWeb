@@ -74,7 +74,33 @@ Schedule::command('predictions:generate-stage2')
     ->withoutOverlapping(10)
     ->appendOutputTo($scheduleLog);
 
+// 結果(race_results)・払戻(payouts)の日次取り込み。
+// data:catch-up は本来 systemd(boatrace-catchup.service, Type=oneshot)経由で
+// 「起動時に一度だけ」実行される設計だったが、PCの電源off運用のため、
+// 起動が翌朝までずれ込む日は前日分の結果が長期間（翌朝の起動まで）
+// 欠落したままになる。2026-10-07・2026-10-09の2回、前日のresults/payoutsが
+// 未取得のまま翌日に持ち越される問題が実際に発生したため、起動タイミングに
+// 依存しない日次実行を追加する。
+// 時刻23:20は、直近1週間の観測で最終レース締切が常に22:54(ナイター開催場)
+// だったことを踏まえ、レース施行(約2分)+Kファイル配信までの猶予として
+// 約25分を見て設定した。
+// --days=2 とし、前日分も併せて再チェックすることで、万一この時刻でもまだ
+// Kファイルが配信されていなかった場合（data:catch-up内のload-resultsは
+// 失敗してもログに警告を残すだけで処理を止めない）、翌日の本ジョブが
+// 自己修復する。
+// data:catch-up は内部でload-results直後にpredictions:judgeも呼ぶため、
+// ここで「結果取り込み→判定」の順序が成立する。23:30の既存predictions:judge
+// は、本ジョブがKファイル未配信等で結果を取り込めなかった場合の保険として
+// そのまま残す（judge側は結果確定済み・未判定のものだけを対象にするため、
+// 対象が無ければ無害に終わる）。
+Schedule::command('data:catch-up', ['--days' => 2])
+    ->dailyAt('23:20')
+    ->timezone(config('app.race_timezone'))
+    ->appendOutputTo($scheduleLog);
+
 // その日の全レース終了後、結果が確定した予測をまとめて判定する。
+// 本来は23:20のdata:catch-up内で既に判定済みだが、その実行時点で結果が
+// 間に合わなかったレースを拾うための二重の安全網として残す。
 Schedule::command('predictions:judge')
     ->dailyAt('23:30')
     ->timezone(config('app.race_timezone'))

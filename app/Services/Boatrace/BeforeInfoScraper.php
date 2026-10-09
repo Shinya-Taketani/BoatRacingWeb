@@ -52,6 +52,15 @@ class BeforeInfoScraper
         }
 
         $html = $response->body();
+        // レスポンス本文はContent-Type/meta共にUTF-8を宣言しているが、稀に
+        // 不正なバイト列(例: マルチバイト文字の途中で途切れた断片)が混入し、
+        // そのままPostgreSQLへinsertするとエンコーディングエラーで該当レース
+        // 全体の取り込みが失敗する（2026-10-09発覚。2026-09-21の稼働開始以降
+        // 75レースで発生していた。原因はCDN側の中間変換等が疑われるが未特定。
+        // 発生頻度・再現性ともに低く、個別調査より「不正なバイト列が来ても
+        // 1文字単位で安全に失う」防御の方が実効的と判断）。mb_scrub()で
+        // 不正なバイト列だけを置換文字に置き換え、残りの正常な部分は保持する。
+        $html = mb_scrub($html, 'UTF-8');
 
         if (str_contains($html, 'データがありません')) {
             throw new BeforeInfoFetchException(
