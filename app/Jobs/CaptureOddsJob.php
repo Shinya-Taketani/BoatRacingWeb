@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Race;
+use App\Services\Boatrace\OddsTableNotFoundException;
 use App\Services\Boatrace\TrifectaOddsResult;
 use App\Services\Boatrace\TrifectaOddsScraper;
 use Illuminate\Bus\Queueable;
@@ -50,7 +51,26 @@ class CaptureOddsJob implements ShouldQueue
             return;
         }
 
-        $result = $scraper->fetch($race->stadium->code, $race->race_no, $race->race_date);
+        try {
+            $result = $scraper->fetch($race->stadium->code, $race->race_no, $race->race_date);
+        } catch (OddsTableNotFoundException $e) {
+            // レース中止・不成立による構造的な欠損は異常ではないため、ログだけ
+            // 残して正常終了する（例外を投げない＝リトライさせずfailed_jobsにも
+            // 残さない）。これを区別せず従来通り例外にしていたため、中止レース
+            // 43件×2回(T-13分/T-5分)=86件がfailed_jobsの大半を占め、監視として
+            // 機能していなかった（2026-10-10発覚。全88件中86件がこれ、残り2件が
+            // 本当の失敗（ネットワークタイムアウト）。詳細はCLAUDE.md
+            // 「CaptureOddsJobの失敗88件の調査」参照）。ネットワークタイムアウト
+            // 等の本当の失敗は従来通りOddsFetchException(の非サブクラス)として
+            // 下のcatchを素通りし、tries=2のリトライ・失敗時はfailed_jobsに
+            // 残る挙動を維持する。
+            Log::info(
+                "CaptureOddsJob: race_id={$this->raceId} odds table not found ".
+                "(race likely cancelled/void): {$e->getMessage()}"
+            );
+
+            return;
+        }
 
         // captured_at は素の Carbon のまま渡してよい。
         // 以前は config/database.php の pgsql 接続に timezone 指定が無く、

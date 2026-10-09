@@ -76,7 +76,11 @@ class TrifectaOddsScraper
         }
 
         if ($targetTable === null) {
-            throw new OddsFetchException(
+            // レース中止・不成立の場合はこの経路に来る（"データがありません"には
+            // ならずページ自体は表示されるが、オッズテーブルが無い）。異常では
+            // ないため専用の例外にして、CaptureOddsJob側でリトライ・failed_jobs
+            // 記録をスキップできるようにする。
+            throw new OddsTableNotFoundException(
                 "3連単オッズテーブルが見つかりません (jcd={$stadiumCode}, rno={$raceNo})"
             );
         }
