@@ -1771,6 +1771,70 @@ walk-forward(6fold)でv1+v2+v3+v5とv1+v2+v3+v5+v6を比較
 実装(`weight_diff.py`/`weight_diff_experiment.py`/
 `lgbm.py`の`fetch_v6_dataset`等)は削除せず残してある。
 
+## 運用フェーズへの移行とdata:reportコマンドの新設（2026-10-10）
+
+モデルの改良を一旦完成とし（上記「本番モデルの改良施策・通算一覧」参照）、
+実運用データの蓄積フェーズに移った。`data:catch-up:status`はOK/NGの
+判定だけで、stage2・オッズは意図的に判定外（部分的なカバレッジが正常の
+ため）にしており、運用の実態が数字で見えない。毎回SQLを書くのは
+非現実的なため、`php artisan data:report --days=N`を新設した
+(`app/Console/Commands/DataReport.php`)。**判定は一切行わず、数字を
+並べるだけ**（異常かどうかは人が見て判断する）。
+
+出力は3つの表（いずれも日別＋期間合計）:
+1. **カバレッジ**: races/results/payouts/predictions/top3_predictions/
+   stage2/live_beforeinfo(race_before_info.source='live')/
+   odds_any(odds_snapshotsの存在)/
+   odds_before_cutoff(captured_at <= deadline_at-10分を満たすオッズの
+   存在、T-13分への変更が効いているかの確認用）の件数と比率。
+   results/payoutsは中止レース除外後の件数が分母、それ以外はraces総数が
+   分母（`DataCoverage::refreshCoverage()`と同じ分母の使い分け）。
+2. **failed_jobs**: ジョブ種別(displayName)ごとの件数（CaptureOddsJobの
+   中止レース起因の失敗は2026-10-10の修正でfailed_jobsに残らなくなった
+   ため、ここに出るものは本当の失敗。CLAUDE.md「CaptureOddsJobの失敗
+   88件の調査」参照）。
+3. **prediction_judgments**: stage別(1=v3当日朝/2=v5直前再予測)の判定済み
+   件数・的中数・的中率。
+
+動作確認（2026-10-10、`--days=10`/`--days=30`で実行）: 0.26秒で完了。
+stage2/live_beforeinfoは2026-10-01〜08が0%、2026-10-09から74.3%・
+2026-10-10が50.0%（まだ当日進行中）と、CLAUDE.md「stage2初回稼働の実態」
+の記録と整合。odds_before_cutoffは2026-10-10時点でもまだ全日0件
+（T-13分への変更(`adff587`)は当日朝の`odds:schedule-today`実行時点の
+コードで予約が決まるため、コミットが当日の06:05 JST実行枠より後だと
+反映が翌日以降になる。これは想定通りの遅延であり不具合ではない）。
+
+### 3ヶ月後(2027-01頃)に評価すること
+
+実運用データが貯まった時点で、以下を評価する。評価の際はwalk-forwardで
+確立した判定ルール（**実験ごとに目安をその場で算出し、全fold一貫を要求**。
+探索（複数候補から事後選択する場面）の場合は**ベースラインが候補群の中で
+何位に位置するかの確認も併用**する。CLAUDE.md「walk-forward検証の導入と
+v5の有意性判定」「top3モデルの正規化とハイパーパラメータ探索」参照）を
+踏襲すること。
+
+1. **stage1(v3) vs stage2(v5)の本番A/B**: `predictions:judge`がstage1/
+   stage2を独立に判定するため、stage2が存在するレースでは**同一レース上
+   の直接対決**になる(`data:report`の`prediction_judgments`表がそのまま
+   素データ)。バックテストの+0.42pt(CLAUDE.md「v5がv3を有意に上回ると
+   判定」参照)が実運用で再現するかを、ペア比較で検証する。**これは過去
+   データのwalk-forward検証では得られない種類の証拠**（本番の配信経路・
+   実際のキュー処理遅延・実際のPC電源off運用を全て経た上での実測）である
+   点を踏まえて評価すること。
+2. **confident_top3の実績が90%を超えるか**: 現在画面に「84%以上、実績
+   90.4%」と表示している(`RacesToday.vue`)。実運用の`prediction_judgments`
+   ベースでの実績を確認し、表示と整合するかを検証する。
+3. **stage2の実カバレッジ**: 初日(2026-10-09)は107/144=74.3%。
+   mb_scrub修正(`828d2ab`)後の実測値を`data:report`で確認する。PC停止
+   時刻以降のナイターレースは構造的に取れないため、上限は100%にならない
+   見込み（CLAUDE.md「stage2初回稼働の実態・バッチ監視の欠陥・2件の実バグ
+   修正」参照）。
+4. **オッズの再検証**: T-13分への変更(`adff587`)後のデータが3ヶ月で約
+   13,000レース分貯まる見込み。2026-10-08の分析は1,843レースという弱い
+   標本だったため、そこで初めてまともな再検証ができる。市場の暗黙確率と
+   モデルの比較を、リーク条件(captured_at <= cutoff_at)を満たしたデータで
+   やり直す。
+
 ## v4_stadium 特徴量（2026-09-21）
 - 場の特性・選手の場適性を追加。`ml/src/ml/features/stadium.py`。
   1. 場×枠番の基礎統計（race_dateより厳密に前の全履歴、expanding window。
