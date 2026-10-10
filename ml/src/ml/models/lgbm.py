@@ -101,10 +101,14 @@ V5_FEATURE_COLUMNS = [
     "weather_water_temperature",
     "weather_condition_code",
 ]
+V6_FEATURE_COLUMNS = [
+    "weight_diff_from_program",
+]
 COMBINED_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS
 ALL_FEATURE_COLUMNS = V1_FEATURE_COLUMNS + V2_FEATURE_COLUMNS + V3_FEATURE_COLUMNS
 WITH_V4_FEATURE_COLUMNS = ALL_FEATURE_COLUMNS + V4_FEATURE_COLUMNS
 WITH_V5_FEATURE_COLUMNS = ALL_FEATURE_COLUMNS + V5_FEATURE_COLUMNS
+WITH_V6_FEATURE_COLUMNS = WITH_V5_FEATURE_COLUMNS + V6_FEATURE_COLUMNS
 # weather_wind_direction_code/weather_condition_codeは名義尺度(順序に意味の
 # 保証がない)なのでcategorical_featureとして扱う。v5特徴量を含まない既存の
 # 実験ではfeature_columnsに存在しないため、この追加は無害(train_model側で
@@ -194,6 +198,51 @@ def fetch_v5_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
     records = []
     for race_id, lane, race_date, payload_v1, payload_v2, payload_v3, payload_v5, finish_pos, has_result_row in rows:
         record = {**payload_v1, **payload_v2, **payload_v3, **payload_v5}
+        record["race_id"] = race_id
+        record["lane"] = lane
+        record["race_date"] = race_date
+        record["finish_pos"] = finish_pos
+        record["is_winner"] = 1 if finish_pos == 1 else 0
+        record["has_result_row"] = has_result_row
+        records.append(record)
+
+    return pl.DataFrame(records)
+
+
+_V6_SELECT_SQL = """
+    SELECT f1.race_id, f1.lane, r.race_date, f1.payload AS payload_v1, f2.payload AS payload_v2,
+           f3.payload AS payload_v3, f5.payload AS payload_v5, f6.payload AS payload_v6,
+           rr.finish_pos, (rr.race_entry_id IS NOT NULL) AS has_result_row
+    FROM features f1
+    JOIN features f2
+        ON f2.race_id = f1.race_id AND f2.lane = f1.lane AND f2.feature_version = 'v2_recent'
+    JOIN features f3
+        ON f3.race_id = f1.race_id AND f3.lane = f1.lane AND f3.feature_version = 'v3_relative'
+    JOIN features f5
+        ON f5.race_id = f1.race_id AND f5.lane = f1.lane AND f5.feature_version = 'v5_exhibition'
+    JOIN features f6
+        ON f6.race_id = f1.race_id AND f6.lane = f1.lane AND f6.feature_version = 'v6_weight_diff'
+    JOIN races r ON r.id = f1.race_id
+    JOIN race_entries re ON re.race_id = f1.race_id AND re.lane = f1.lane
+    LEFT JOIN race_results rr ON rr.race_entry_id = re.id
+    WHERE f1.feature_version = 'v1_basic' AND r.race_date BETWEEN %s AND %s
+    ORDER BY f1.race_id, f1.lane
+"""
+
+
+def fetch_v6_dataset(conn: psycopg.Connection, start, end) -> pl.DataFrame:
+    """v1_basic + v2_recent + v3_relative + v5_exhibition + v6_weight_diff の
+    payload をマージする。"""
+    with conn.cursor() as cur:
+        cur.execute(_V6_SELECT_SQL, (start, end))
+        rows = cur.fetchall()
+
+    records = []
+    for (
+        race_id, lane, race_date, payload_v1, payload_v2, payload_v3, payload_v5, payload_v6,
+        finish_pos, has_result_row,
+    ) in rows:
+        record = {**payload_v1, **payload_v2, **payload_v3, **payload_v5, **payload_v6}
         record["race_id"] = race_id
         record["lane"] = lane
         record["race_date"] = race_date

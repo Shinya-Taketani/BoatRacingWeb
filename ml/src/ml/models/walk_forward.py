@@ -118,10 +118,12 @@ from ml.models.lgbm import (
     ALL_FEATURE_COLUMNS,
     DEFAULT_NUM_BOOST_ROUND,
     WITH_V5_FEATURE_COLUMNS,
+    WITH_V6_FEATURE_COLUMNS,
     compute_time_decay_weights,
     evaluate,
     fetch_all_dataset,
     fetch_v5_dataset,
+    fetch_v6_dataset,
     predict_race_normalized,
     train_model,
     train_model_with_early_stopping,
@@ -147,6 +149,7 @@ CONFIDENT_TOP3_THRESHOLD = 0.96
 FEATURE_SETS = {
     "v3": (fetch_all_dataset, ALL_FEATURE_COLUMNS),
     "v5": (fetch_v5_dataset, WITH_V5_FEATURE_COLUMNS),
+    "v6": (fetch_v6_dataset, WITH_V6_FEATURE_COLUMNS),
 }
 
 
@@ -696,10 +699,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--feature-set",
-        choices=["v3", "v5", "both"],
+        choices=["v3", "v5", "v6", "both", "v5_vs_v6"],
         default="both",
-        help="v3/v5/both(デフォルト、v3とv5の両方を実行し比較まで出す)。"
-        "--weight-sweep時はv3/v5のいずれか単体のみ指定可(bothは不可)",
+        help="v3/v5/v6/both(デフォルト、v3とv5を比較)/v5_vs_v6(v5とv6を比較)。"
+        "--weight-sweep等ではv3/v5/v6のいずれか単体のみ指定可(bothとv5_vs_v6は不可)",
     )
     parser.add_argument("--num-boost-round", type=int, default=DEFAULT_NUM_BOOST_ROUND)
     parser.add_argument(
@@ -755,8 +758,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.boosting_compare:
-        if args.feature_set == "both":
-            parser.error("--boosting-compare では --feature-set は v3 か v5 を指定してください(bothは不可)")
+        if args.feature_set in ("both", "v5_vs_v6"):
+            parser.error("--boosting-compare では --feature-set は v3/v5/v6 のいずれかを指定してください(bothとv5_vs_v6は不可)")
 
         fixed_results: list[FoldResult] = []
         es_results: list[FoldResult] = []
@@ -788,8 +791,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.random_search:
-        if args.feature_set == "both":
-            parser.error("--random-search では --feature-set は v3 か v5 を指定してください(bothは不可)")
+        if args.feature_set in ("both", "v5_vs_v6"):
+            parser.error("--random-search では --feature-set は v3/v5/v6 のいずれかを指定してください(bothとv5_vs_v6は不可)")
 
         if args.boost_rounds is None:
             boost_rounds: int | dict[int, int] = args.num_boost_round
@@ -858,8 +861,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.weight_sweep:
-        if args.feature_set == "both":
-            parser.error("--weight-sweep では --feature-set は v3 か v5 を指定してください(bothは不可)")
+        if args.feature_set in ("both", "v5_vs_v6"):
+            parser.error("--weight-sweep では --feature-set は v3/v5/v6 のいずれかを指定してください(bothとv5_vs_v6は不可)")
 
         half_life_months = [float(x) for x in args.half_life_months.split(",")]
         candidates: list[tuple[str, str | None, float | None]] = [("no_weight", None, None)] + [
@@ -911,7 +914,12 @@ def main(argv: list[str] | None = None) -> int:
     conn = get_connection()
     try:
         results_by_set: dict[str, list[FoldResult]] = {}
-        feature_sets = ["v3", "v5"] if args.feature_set == "both" else [args.feature_set]
+        if args.feature_set == "both":
+            feature_sets = ["v3", "v5"]
+        elif args.feature_set == "v5_vs_v6":
+            feature_sets = ["v5", "v6"]
+        else:
+            feature_sets = [args.feature_set]
         for fs in feature_sets:
             results = run_walk_forward(conn, fs, num_boost_round=args.num_boost_round)
             results_by_set[fs] = results
@@ -921,6 +929,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.feature_set == "both":
         compare("v3", results_by_set["v3"], "v5", results_by_set["v5"])
+    elif args.feature_set == "v5_vs_v6":
+        compare("v5", results_by_set["v5"], "v6", results_by_set["v6"])
 
     return 0
 
